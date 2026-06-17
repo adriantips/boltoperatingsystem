@@ -4,7 +4,14 @@
 # An e1000 NIC on user-mode (slirp) NAT gives the browser real internet: slirp
 # hands out 10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3 -- the kernel defaults.
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-QEMU=/c/Program\ Files/qemu/qemu-system-x86_64.exe
+
+# Detect QEMU across msys2, Git Bash, and WSL mount styles
+[ -f /c/Program\ Files/qemu/qemu-system-x86_64.exe ] && QEMU=/c/Program\ Files/qemu/qemu-system-x86_64.exe
+[ -z "${QEMU-}" ] && [ -f /mnt/c/Program\ Files/qemu/qemu-system-x86_64.exe ] && QEMU=/mnt/c/Program\ Files/qemu/qemu-system-x86_64.exe
+[ -z "${QEMU-}" ] && { echo "ERROR: QEMU not found"; exit 1; }
+
+# Convert ROOT to Windows path when under WSL (QEMU is a Windows exe)
+command -v wslpath &>/dev/null && ROOT=$(wslpath -w "$ROOT")
 exec "$QEMU" \
     -drive file="$ROOT/iso/os.img",format=raw,if=ide \
     -drive file="$ROOT/iso/boltos.iso",if=ide,media=cdrom \

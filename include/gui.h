@@ -83,6 +83,7 @@ int       gui_panel_w(void);                /* physical panel width (fixed)    *
 int       gui_panel_h(void);                /* physical panel height (fixed)   */
 int       gui_window_focused(window_t *win);
 void      gui_run(void);                    /* enter the desktop; never returns*/
+void      gui_pump(void);                   /* force one composite+blit (re-entrant)*/
 
 /* Re-read the live settings: relayout the logical desktop / letterbox, retint
  * the theme and re-render the wallpaper. Called by the Settings app on change. */
@@ -103,4 +104,5 @@ void taskmgr_app_init(void);
 void settings_app_init(void);
 void browser_app_init(void);
 void files_app_init(void);
+void python_app_init(void);
 void files_open_node(struct fs_node *n);   /* open a folder in the explorer / a file in its viewer */

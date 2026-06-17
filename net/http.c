@@ -1,22 +1,25 @@
 #include <stdint.h>
 #include "http.h"
 #include "net.h"
+#include "tls.h"
 #include "string.h"
 #include "kprintf.h"
 
-/* split "http://host:port/path" -> host, port, path. Returns 0 on success. */
-static int parse_url(const char *url, char *host, uint32_t hcap,
-                     uint16_t *port, char *path, uint32_t pcap) {
+/* split "http[s]://host:port/path" -> host, port, path; *secure set for https.
+ * Returns 0 on success. */
+static int parse_url(const char *url, char *host, uint32_t hcap, uint16_t *port,
+                     char *path, uint32_t pcap, int *secure) {
     const char *s = url;
+    *secure = 0;
     if (strncmp(s, "http://", 7) == 0) s += 7;
-    else if (strncmp(s, "https://", 8) == 0) return -2;     /* no TLS */
+    else if (strncmp(s, "https://", 8) == 0) { s += 8; *secure = 1; }
 
     uint32_t i = 0;
     while (*s && *s != '/' && *s != ':' && i < hcap - 1) host[i++] = *s++;
     host[i] = 0;
     if (i == 0) return -1;
 
-    *port = 80;
+    *port = *secure ? 443 : 80;
     if (*s == ':') {
         s++; int p = 0;
         while (*s >= '0' && *s <= '9') p = p * 10 + (*s++ - '0');
@@ -70,16 +73,19 @@ static void find_header(const char *hdr, const char *name, char *out, uint32_t c
 int http_get(const char *url, char *out, uint32_t cap,
              int *status, char *location, uint32_t loc_cap) {
     char host[128], path[512];
-    uint16_t port;
-    int pr = parse_url(url, host, sizeof(host), &port, path, sizeof(path));
-    if (pr == -2) { if (status) *status = -2; return -1; }   /* https unsupported */
+    uint16_t port; int secure;
+    int pr = parse_url(url, host, sizeof(host), &port, path, sizeof(path), &secure);
     if (pr != 0)  { if (status) *status = 0;  return -1; }
 
     uint32_t ip;
     if (!dns_resolve(host, &ip, 3000)) { if (status) *status = -3; return -1; } /* DNS fail */
 
-    struct tcp_conn *c = tcp_connect(ip, port, 5000);
-    if (!c) { if (status) *status = -4; return -1; }         /* connect fail */
+    /* one transport, two backends: plain TCP for http, TLS for https */
+    struct tcp_conn *tc = 0; struct tls_conn *sc = 0;
+    if (secure) { sc = tls_connect(ip, port, host, 8000);
+                  if (!sc) { if (status) *status = -5; return -1; } }   /* TLS fail */
+    else        { tc = tcp_connect(ip, port, 5000);
+                  if (!tc) { if (status) *status = -4; return -1; } }   /* connect fail */
 
     /* build and send the request */
     char req[800];
@@ -88,17 +94,23 @@ int http_get(const char *url, char *out, uint32_t cap,
                             "\r\nUser-Agent: BoltOS/1.0\r\nConnection: close\r\n\r\n" };
     for (uint32_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++)
         for (const char *q = parts[i]; *q && n < (int)sizeof(req) - 1; ) req[n++] = *q++;
-    if (tcp_send(c, req, (uint32_t)n) < 0) { tcp_close(c); if (status) *status = -4; return -1; }
+    int sret = secure ? tls_send(sc, req, (uint32_t)n) : tcp_send(tc, req, (uint32_t)n);
+    if (sret < 0) {
+        if (secure) tls_close(sc); else tcp_close(tc);
+        if (status) *status = secure ? -5 : -4;
+        return -1;
+    }
 
     /* read the whole response into out */
     uint32_t total = 0;
     for (;;) {
         if (total >= cap - 1) break;
-        int r = tcp_recv(c, out + total, cap - 1 - total, 8000);
+        int r = secure ? tls_recv(sc, out + total, cap - 1 - total, 8000)
+                       : tcp_recv(tc, out + total, cap - 1 - total, 8000);
         if (r <= 0) break;
         total += (uint32_t)r;
     }
-    tcp_close(c);
+    if (secure) tls_close(sc); else tcp_close(tc);
     out[total] = 0;
 
     if (status) *status = parse_status(out);

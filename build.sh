@@ -38,12 +38,14 @@ SRCS=(
     kernel/gdt.c kernel/idt.c kernel/interrupts.c kernel/pic.c kernel/pit.c
     kernel/hw.c kernel/pci.c kernel/sysreg.c kernel/sched.c
     net/netif.c net/driver.c net/eth.c net/arp.c net/ip.c net/icmp.c net/udp.c
-    net/tcp.c net/dns.c net/http.c
+    net/tcp.c net/dns.c net/crypto.c net/tls.c net/http.c
     net/wifi.c net/firmware.c drivers/e1000.c
     kernel/cmd_fs.c kernel/cmd_sys.c kernel/cmd_proc.c kernel/cmd_net.c kernel/cmd_extra.c
     kernel/html.c
     kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c kernel/app_browser.c kernel/app_files.c
+    kernel/app_python.c
     kernel/settings.c
+    kernel/boltpy.c kernel/cmd_python.c
     fs/ramfs.c
     drivers/keyboard.c drivers/framebuffer.c drivers/mouse.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
 )

@@ -178,6 +178,7 @@ const command_t commands[] = {
     { "help",     "Core",             "show this list",                     cmd_help },
     { "echo",     "Core",             "print text back",                    cmd_echo },
     { "clear",    "Core",             "clear the screen",                   cmd_clear },
+    { "python",   "Core",             "BoltPython REPL / run a .py file",    cmd_python },
 };
 const int commands_count = (int)(sizeof(commands) / sizeof(commands[0]));
 

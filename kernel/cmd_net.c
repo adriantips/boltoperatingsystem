@@ -110,9 +110,9 @@ int cmd_trace(int argc, char **argv) {
 
 /* print an HTTP error from a negative/zero status code */
 static void http_err(int code) {
-    if      (code == -2) kprintf("https is not supported (http only)\n");
-    else if (code == -3) kprintf("DNS lookup failed\n");
+    if      (code == -3) kprintf("DNS lookup failed\n");
     else if (code == -4) kprintf("connection failed / timed out\n");
+    else if (code == -5) kprintf("TLS handshake failed\n");
     else                 kprintf("request failed\n");
 }
 
@@ -164,7 +164,7 @@ int cmd_browse(int argc, char **argv) {
     const char *url = argv[1];
     html_doc *d = 0;
 
-    int http = (strncmp(url, "http://", 7) == 0);
+    int http = (strncmp(url, "http://", 7) == 0) || (strncmp(url, "https://", 8) == 0);
     if (!http && url[0] != '/' && strncmp(url, "file:", 5) != 0) {
         const char *slash = strchr(url, '/'), *dot = strchr(url, '.');
         if (dot && (!slash || dot < slash)) http = 1;     /* looks like a host */
@@ -176,7 +176,9 @@ int cmd_browse(int argc, char **argv) {
         char *buf = (char *)kmalloc(cap);
         if (!buf) { kprintf("browse: out of memory\n"); return 1; }
         char full[300];
-        if (strncmp(url, "http://", 7) != 0) { full[0] = 0; strcat(full, "http://"); strcat(full, url); url = full; }
+        if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+            full[0] = 0; strcat(full, "http://"); strcat(full, url); url = full;
+        }
         int code = 0; char loc[256];
         int blen = http_get(url, buf, cap, &code, loc, sizeof(loc));
         if (blen < 0) { http_err(code); kfree(buf); return 1; }

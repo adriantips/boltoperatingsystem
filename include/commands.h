@@ -67,4 +67,4 @@ int cmd_story(int, char **);
 
 /* ---- handlers: Core ----------------------------------------------------- */
 int cmd_help(int, char **);   int cmd_echo(int, char **);   int cmd_clear(int, char **);
-int cmd_mem(int, char **);
+int cmd_mem(int, char **);    int cmd_python(int, char **);

@@ -1,7 +1,7 @@
 /* ===========================================================================
  *  BoltOS  -  kernel/app_browser.c
- *  A small web browser window. Loads http:// pages over the BoltOS TCP/DNS/HTTP
- *  stack (no TLS, so http only) and local files from the ramfs, flattens the
+ *  A small web browser window. Loads http:// and https:// pages over the BoltOS
+ *  TCP/DNS/TLS/HTTP stack and local files from the ramfs, flattens the
  *  HTML with html_parse(), then word-wraps and paints the run list. Links are
  *  clickable; an address bar drives navigation; Back walks history.
  * ===========================================================================*/
@@ -118,26 +118,29 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
 }
 
 /* ---- URL / link resolution --------------------------------------------- */
-static int is_http(const char *u) { return strncmp(u, "http://", 7) == 0; }
+static int is_http(const char *u)  { return strncmp(u, "http://", 7) == 0; }
+static int is_https(const char *u) { return strncmp(u, "https://", 8) == 0; }
+static int is_remote(const char *u) { return is_http(u) || is_https(u); }
+static uint32_t scheme_len(const char *u) { return is_https(u) ? 8 : (is_http(u) ? 7 : 0); }
 
-/* extract "host" (and optional port) from an http url into out */
+/* extract "host" (and optional port) from a remote url into out */
 static void url_host(const char *url, char *out, uint32_t cap) {
-    const char *s = url; if (is_http(s)) s += 7;
+    const char *s = url + scheme_len(url);
     uint32_t i = 0; while (*s && *s != '/' && i < cap - 1) out[i++] = *s++;
     out[i] = 0;
 }
 
 /* resolve href (possibly relative) against the current page url */
 static void resolve_link(browser_t *st, const char *href, char *out, uint32_t cap) {
-    if (is_http(href) || strncmp(href, "https://", 8) == 0) { scopy(out, href, cap); return; }
+    if (is_remote(href)) { scopy(out, href, cap); return; }
     if (href[0] == '#') { scopy(out, st->url, cap); return; }
 
-    if (is_http(st->url)) {
+    if (is_remote(st->url)) {
         char host[160]; url_host(st->url, host, sizeof(host));
-        out[0] = 0; sappend(out, "http://", cap); sappend(out, host, cap);
+        out[0] = 0; sappend(out, is_https(st->url) ? "https://" : "http://", cap); sappend(out, host, cap);
         if (href[0] == '/') { sappend(out, href, cap); return; }
         /* relative to current directory */
-        const char *path = st->url + 7; const char *slash = strrchr(path, '/');
+        const char *path = st->url + scheme_len(st->url); const char *slash = strrchr(path, '/');
         if (slash && slash > path) { /* copy dir part after host */
             char dir[256]; uint32_t n = 0; const char *p = strchr(path, '/');
             for (; p && p <= slash && n < sizeof(dir) - 1; p++) dir[n++] = *p;
@@ -170,9 +173,9 @@ static int load_http(browser_t *st, const char *url, int depth) {
     int code = 0; char loc[256];
     int blen = http_get(url, buf, HTTP_CAP, &code, loc, sizeof(loc));
     if (blen < 0) {
-        if (code == -2)      set_status(st, "https is not supported (http only)");
-        else if (code == -3) set_status(st, "DNS lookup failed");
+        if (code == -3)      set_status(st, "DNS lookup failed");
         else if (code == -4) set_status(st, "connection failed / timed out");
+        else if (code == -5) set_status(st, "TLS handshake failed");
         else                 set_status(st, "request failed");
         kfree(buf);
         return 0;
@@ -230,7 +233,7 @@ static void load_url(browser_t *st, const char *url, int depth) {
     if (!*url) return;
 
     int ok;
-    if (is_http(url) || strncmp(url, "https://", 8) == 0) {
+    if (is_remote(url)) {
         ok = load_http(st, url, depth);
     } else if (url[0] == '/' || strncmp(url, "file:", 5) == 0) {
         ok = load_fs(st, url);
@@ -391,12 +394,13 @@ static void browser_click(window_t *w, int lx, int ly) {
 static const char WELCOME[] =
     "<title>BoltOS Browser</title>"
     "<h1>BoltOS Browser</h1>"
-    "<p>A tiny web browser running on a from-scratch kernel. It speaks HTTP over "
-    "the BoltOS TCP/IP stack (no TLS yet, so <b>http://</b> only) and can open "
-    "local HTML files from the ramfs.</p>"
+    "<p>A tiny web browser running on a from-scratch kernel. It speaks HTTP and "
+    "HTTPS (TLS 1.2: ECDHE-X25519 / AES-128-GCM) over the BoltOS TCP/IP stack, and "
+    "can open local HTML files from the ramfs. The server certificate is not "
+    "verified, so treat <b>https://</b> here as eavesdrop-resistant, not trusted.</p>"
     "<h2>Try it</h2>"
     "<ul>"
-    "<li>Type a URL in the bar and press <b>Go</b> (e.g. <a href=\"http://example.com\">http://example.com</a>)</li>"
+    "<li>Type a URL in the bar and press <b>Go</b> (e.g. <a href=\"https://example.com\">https://example.com</a>)</li>"
     "<li>Open the bundled page: <a href=\"/web/index.html\">/web/index.html</a></li>"
     "<li>Scroll with the scrollbar, or Space / b, or the j / k keys</li>"
     "<li>Click <b>&lt;</b> to go back</li>"

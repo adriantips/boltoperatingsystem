@@ -787,6 +787,18 @@ static int output_is_native(void) {
     return out_x == 0 && out_y == 0 && out_w == PW && out_h == PH && W == PW && H == PH;
 }
 
+/* Force one composite + blit right now. Lets a blocking command (e.g. the
+ * `python` REPL waiting on keyboard input) keep the desktop on screen instead
+ * of freezing it. No-op before the desktop is up (BB not yet allocated). */
+void gui_pump(void) {
+    if (!BB) return;
+    composite();
+    if (output_is_native()) fb_blit(BB);
+    else fb_blit_scaled(BB, (uint32_t)W, (uint32_t)H,
+                        (uint32_t)out_x, (uint32_t)out_y, (uint32_t)out_w, (uint32_t)out_h);
+    dirty = 0;
+}
+
 /* ===========================================================================
  *  Boot screen + main loop
  * ===========================================================================*/
@@ -808,6 +820,7 @@ void gui_run(void) {
     terminal_app_init();
     files_app_init();
     browser_app_init();
+    python_app_init();
     taskmgr_app_init();
     settings_app_init();
     for (int i = 0; i < nwin; i++) gui_open(&wins[i]);   /* show the apps */

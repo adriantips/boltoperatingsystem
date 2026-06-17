@@ -10,8 +10,11 @@ GRUB, no Multiboot, no external libraries. Custom MBR boot chain, own kernel.
 A small windowed **Browser** app renders basic HTML — headings, paragraphs,
 lists, links, bold and preformatted text. It loads:
 
-- **`http://` pages** over the kernel's own TCP/IP stack (DNS → TCP → HTTP/1.0).
-  There is no TLS yet, so `https://` is unsupported.
+- **`http://` and `https://` pages** over the kernel's own stack
+  (DNS → TCP → TLS → HTTP/1.0). HTTPS uses an in-kernel TLS 1.2 client
+  (ECDHE-X25519 + AES-128-GCM + SHA-256, `net/tls.c` + `net/crypto.c`). The
+  server certificate is **not** verified — it resists passive eavesdropping,
+  not an active MITM — and TLS 1.3-only / gzipped / chunked sites won't render.
 - **local HTML files** from the ramfs (e.g. the bundled `/web/index.html`).
 
 Click links to navigate, type a URL in the address bar, `<` goes back, and the

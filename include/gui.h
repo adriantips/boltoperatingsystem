@@ -47,6 +47,7 @@ void g_text (int x, int y, const char *s, uint32_t color, int scale);
 int  g_text_width(const char *s, int scale);
 void g_set_clip(int x, int y, int w, int h);
 void g_clear_clip(void);
+void gui_icon(int id, int x, int y, int scale, uint32_t color);   /* draw an ICON_* glyph */
 
 /* ---- windows ----------------------------------------------------------- */
 typedef struct window window_t;
@@ -68,7 +69,8 @@ struct window {
     void  *st;                       /* app private state                      */
 };
 
-enum { ICON_NONE = 0, ICON_TERMINAL, ICON_TASKMGR, ICON_START, ICON_FILES, ICON_SETTINGS, ICON_BROWSER };
+enum { ICON_NONE = 0, ICON_TERMINAL, ICON_TASKMGR, ICON_START, ICON_FILES, ICON_SETTINGS,
+       ICON_BROWSER, ICON_FOLDER, ICON_FILE, ICON_TRASH };
 
 window_t *gui_add_window(const char *title, int w, int h, uint32_t accent, int icon);
 void      gui_open(window_t *win);          /* show + focus + raise           */
@@ -86,8 +88,19 @@ void      gui_run(void);                    /* enter the desktop; never returns*
  * the theme and re-render the wallpaper. Called by the Settings app on change. */
 void      gui_apply_display(void);
 
+/* ---- desktop icons + drag-and-drop ------------------------------------- *
+ *  The desktop hosts a layer of shortcut icons (folders/files/trash). Apps may
+ *  drop an item onto the desktop by arming a drag while handling a click; the
+ *  compositor follows the cursor and, on release over the wallpaper, creates a
+ *  shortcut. Double-clicking a desktop icon opens it via files_open_node().    */
+struct fs_node;
+void gui_desktop_add(struct fs_node *node, const char *label, int icon); /* seed a shortcut */
+void gui_begin_item_drag(struct fs_node *node, const char *label, int icon); /* arm a drag */
+
 /* ---- apps -------------------------------------------------------------- */
 void terminal_app_init(void);
 void taskmgr_app_init(void);
 void settings_app_init(void);
 void browser_app_init(void);
+void files_app_init(void);
+void files_open_node(struct fs_node *n);   /* open a folder in the explorer / a file in its viewer */

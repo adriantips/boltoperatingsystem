@@ -16,6 +16,7 @@
 #include "hw.h"
 #include "shell.h"
 #include "string.h"
+#include "fs.h"
 
 extern const unsigned char font8x8_basic[128][8];
 
@@ -23,6 +24,8 @@ extern const unsigned char font8x8_basic[128][8];
 #define TASKBAR_H  48
 #define RADIUS     9
 #define MAX_WIN    8
+#define DI_W       80              /* desktop icon cell width  */
+#define DI_H       86              /* desktop icon cell height */
 
 static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
@@ -40,6 +43,7 @@ static int       clx0, cly0, clx1, cly1;   /* active clip rect (exclusive hi) */
 
 static int imin(int a, int b) { return a < b ? a : b; }
 static int imax(int a, int b) { return a > b ? a : b; }
+static int iabs(int v) { return v < 0 ? -v : v; }
 static int isqrt(int v) { int r = 0; while ((r + 1) * (r + 1) <= v) r++; return r; }
 
 void g_set_clip(int x, int y, int w, int h) {
@@ -281,11 +285,42 @@ static void draw_icon(int id, int x, int y, int s, uint32_t c) {
         g_hline(cxx - r + s, cyy + 3 * s, 2 * (r - s), in);
         break;
     }
+    case ICON_FOLDER: {                         /* manila folder (Windows-ish) */
+        uint32_t body = 0xE7B24A, lid = 0xF3C766, lip = 0xC8932E;
+        g_round(x, y + 2 * s, 8 * s, 4 * s, 2 * s, lid, 255);    /* back tab     */
+        g_round(x, y + 4 * s, 16 * s, 9 * s, 2 * s, lip, 255);   /* rear panel   */
+        g_round(x, y + 5 * s, 16 * s, 8 * s, 2 * s, body, 255);  /* front flap   */
+        g_fill(x + 2 * s, y + 6 * s, 12 * s, s, lid);            /* highlight     */
+        (void)c;
+        break;
+    }
+    case ICON_FILE: {                           /* document page with folded corner */
+        uint32_t pg = 0xF5F7FC, fold = 0xCAD6EE, ln = 0x9AA7C2;
+        g_round(x + 2 * s, y, 11 * s, 14 * s, 2 * s, pg, 255);
+        g_fill(x + 2 * s + 7 * s, y, 4 * s, 4 * s, fold);        /* dog-ear       */
+        for (int i = 0; i < 4; i++)                              /* text lines    */
+            g_fill(x + 4 * s, y + 6 * s + i * 2 * s, 7 * s, s, ln);
+        (void)c;
+        break;
+    }
+    case ICON_TRASH: {                          /* recycle bin */
+        uint32_t metal = 0x9AA7BE, dark = 0x5E6A82;
+        g_fill(x + 6 * s, y, 4 * s, s, metal);                   /* handle        */
+        g_fill(x + 2 * s, y + s, 12 * s, 2 * s, metal);          /* lid           */
+        g_round(x + 3 * s, y + 3 * s, 10 * s, 11 * s, 2 * s, metal, 255); /* body  */
+        g_fill(x + 5 * s,  y + 5 * s, s, 7 * s, dark);           /* slots         */
+        g_fill(x + 8 * s,  y + 5 * s, s, 7 * s, dark);
+        g_fill(x + 11 * s, y + 5 * s, s, 7 * s, dark);
+        (void)c;
+        break;
+    }
     default:
         g_round(x, y, 14 * s, 12 * s, 2 * s, c, 255);
         break;
     }
 }
+
+void gui_icon(int id, int x, int y, int scale, uint32_t color) { draw_icon(id, x, y, scale, color); }
 
 /* ===========================================================================
  *  Window frame
@@ -433,12 +468,137 @@ static void draw_cursor(void) {
 }
 
 /* ===========================================================================
+ *  Desktop icons + drag-and-drop
+ * ===========================================================================*/
+#define MAX_DESKICON 16
+typedef struct { int used, x, y, icon; char label[40]; fs_node *node; } deskicon_t;
+static deskicon_t dicons[MAX_DESKICON];
+static int      desk_sel = -1;
+static int      desk_drag = -1, desk_dx, desk_dy;
+static uint64_t desk_last_tick;
+static int      desk_last_idx = -1;
+
+/* drag payload (a file/folder being dragged out of a window onto the desktop) */
+static fs_node *dnd_node;
+static char     dnd_label[40];
+static int      dnd_icon, dnd_armed, dnd_active, dnd_px, dnd_py, press_x, press_y;
+
+static int deskicon_find(fs_node *n) {
+    for (int i = 0; i < MAX_DESKICON; i++) if (dicons[i].used && dicons[i].node == n) return i;
+    return -1;
+}
+static void deskicon_autopos(int *ox, int *oy) {
+    int used = 0;
+    for (int i = 0; i < MAX_DESKICON; i++) if (dicons[i].used) used++;
+    int per_col = (H - TASKBAR_H - 16) / DI_H; if (per_col < 1) per_col = 1;
+    *ox = 16 + (used / per_col) * DI_W;
+    *oy = 16 + (used % per_col) * DI_H;
+}
+static void deskicon_clamp(deskicon_t *d) {
+    if (d->x < 0) d->x = 0; if (d->x > W - DI_W) d->x = W - DI_W;
+    if (d->y < 0) d->y = 0; if (d->y > H - TASKBAR_H - DI_H) d->y = H - TASKBAR_H - DI_H;
+}
+
+void gui_desktop_add(fs_node *node, const char *label, int icon) {
+    if (!node || deskicon_find(node) >= 0) return;
+    for (int i = 0; i < MAX_DESKICON; i++) {
+        if (dicons[i].used) continue;
+        dicons[i].used = 1; dicons[i].node = node; dicons[i].icon = icon;
+        strncpy(dicons[i].label, label ? label : "item", sizeof(dicons[i].label));
+        deskicon_autopos(&dicons[i].x, &dicons[i].y);
+        dirty = 1;
+        return;
+    }
+}
+
+/* place (or move) a dropped item's shortcut centred on the drop point */
+static void deskicon_drop(fs_node *n, const char *label, int icon, int x, int y) {
+    int idx = deskicon_find(n);
+    if (idx < 0) {
+        for (int i = 0; i < MAX_DESKICON && idx < 0; i++) if (!dicons[i].used) idx = i;
+        if (idx < 0) return;
+        dicons[idx].used = 1; dicons[idx].node = n; dicons[idx].icon = icon;
+        strncpy(dicons[idx].label, label ? label : "item", sizeof(dicons[idx].label));
+    }
+    dicons[idx].x = x - DI_W / 2; dicons[idx].y = y - 28;
+    deskicon_clamp(&dicons[idx]);
+    desk_sel = idx; dirty = 1;
+}
+
+void gui_begin_item_drag(fs_node *node, const char *label, int icon) {
+    if (!node) return;
+    dnd_node = node; dnd_icon = icon; dnd_armed = 1; dnd_active = 0;
+    strncpy(dnd_label, label ? label : "item", sizeof(dnd_label));
+    press_x = mlx(); press_y = mly();
+}
+
+static void deskicon_label(const char *src, char *out, int cap) {
+    int maxc = (DI_W - 6) / 8; if (maxc > cap - 1) maxc = cap - 1;
+    int len = (int)strlen(src);
+    if (len <= maxc) { strncpy(out, src, cap); return; }
+    int k = 0; for (; k < maxc - 2; k++) out[k] = src[k];
+    out[k++] = '.'; out[k++] = '.'; out[k] = 0;
+}
+
+static void draw_desktop_icons(void) {
+    int mxp = mlx(), myp = mly();
+    for (int i = 0; i < MAX_DESKICON; i++) {
+        if (!dicons[i].used) continue;
+        deskicon_t *d = &dicons[i];
+        int hot = mxp >= d->x && mxp < d->x + DI_W && myp >= d->y && myp < d->y + DI_H;
+        if (i == desk_sel) g_round(d->x, d->y, DI_W, DI_H, 8, COL_ACCENT, 70);
+        else if (hot)      g_round(d->x, d->y, DI_W, DI_H, 8, 0xFFFFFF, 26);
+        int s = 3, iw = 16 * s;
+        draw_icon(d->icon, d->x + (DI_W - iw) / 2, d->y + 8, s, COL_TEXT);
+        char lb[18]; deskicon_label(d->label, lb, sizeof(lb));
+        int tw = g_text_width(lb, 1), tx = d->x + (DI_W - tw) / 2, ty = d->y + 8 + iw + 6;
+        g_text(tx + 1, ty + 1, lb, 0x000000, 1);        /* drop shadow for legibility */
+        g_text(tx, ty, lb, 0xFFFFFF, 1);
+    }
+}
+
+static void draw_drag_ghost(void) {
+    int s = 2, iw = 16 * s, x = dnd_px - iw / 2, y = dnd_py - iw / 2;
+    g_round(x - 6, y - 4, iw + 12, iw + 24, 8, 0x000000, 70);
+    draw_icon(dnd_icon, x, y, s, COL_TEXT);
+    int tw = g_text_width(dnd_label, 1);
+    g_text(dnd_px - tw / 2, y + iw + 4, dnd_label, 0xFFFFFF, 1);
+}
+
+static int deskicon_hit(int x, int y) {
+    for (int i = MAX_DESKICON - 1; i >= 0; i--) {
+        if (!dicons[i].used) continue;
+        deskicon_t *d = &dicons[i];
+        if (x >= d->x && x < d->x + DI_W && y >= d->y && y < d->y + DI_H) return i;
+    }
+    return -1;
+}
+
+static void deskicon_open(int i) {
+    if (i < 0 || i >= MAX_DESKICON || !dicons[i].used || !dicons[i].node) return;
+    files_open_node(dicons[i].node);
+}
+
+/* drop point over the wallpaper (not a window, taskbar or menu) -> make shortcut */
+static void dnd_drop(int x, int y) {
+    if (!dnd_node) return;
+    if (y >= H - TASKBAR_H) return;
+    for (int i = 0; i < nwin; i++) {
+        window_t *w = &wins[i];
+        if (w->open && !w->minimized && x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h) return;
+    }
+    deskicon_drop(dnd_node, dnd_label, dnd_icon, x, y);
+}
+
+/* ===========================================================================
  *  Compositor
  * ===========================================================================*/
 static void composite(void) {
     g_clear_clip();
     if (BG) { for (int i = 0; i < W * H; i++) BB[i] = BG[i]; }
     else    render_wallpaper(BB);
+
+    draw_desktop_icons();
 
     /* windows back-to-front by z */
     for (int pass = 0; pass <= ztop; pass++)
@@ -448,6 +608,7 @@ static void composite(void) {
 
     draw_start_menu();
     draw_taskbar();
+    if (dnd_active) draw_drag_ghost();
     draw_cursor();
 }
 
@@ -534,6 +695,20 @@ static void on_left_down(int x, int y) {
             return;
         }
     }
+
+    /* nothing else hit: the desktop. Select / double-click-open / arm reposition. */
+    int di = deskicon_hit(x, y);
+    if (di >= 0) {
+        uint64_t now = pit_ticks();
+        if (desk_last_idx == di && now - desk_last_tick < 400) {   /* double-click */
+            desk_sel = di; desk_last_idx = -1; deskicon_open(di); return;
+        }
+        desk_sel = di; desk_last_idx = di; desk_last_tick = now;
+        desk_drag = di; desk_dx = x - dicons[di].x; desk_dy = y - dicons[di].y;
+        dirty = 1;
+        return;
+    }
+    desk_sel = -1;                                   /* click on empty wallpaper */
 }
 
 static void handle_mouse(void) {
@@ -542,12 +717,22 @@ static void handle_mouse(void) {
     uint8_t down = b & ~prev_btns;
     uint8_t up   = prev_btns & ~b;
 
-    if (drag_id >= 0) {
+    if (drag_id >= 0) {                              /* dragging a window */
         if (b & MOUSE_LEFT) { wins[drag_id].x = x - drag_dx; wins[drag_id].y = y - drag_dy; clamp_window(&wins[drag_id]); }
         if (up & MOUSE_LEFT)  drag_id = -1;
+    } else if (desk_drag >= 0) {                     /* repositioning a desktop icon */
+        if (b & MOUSE_LEFT) { dicons[desk_drag].x = x - desk_dx; dicons[desk_drag].y = y - desk_dy; deskicon_clamp(&dicons[desk_drag]); }
+        if (up & MOUSE_LEFT)  desk_drag = -1;
+    } else if (dnd_active) {                          /* dragging an item to the desktop */
+        dnd_px = x; dnd_py = y;
+        if (up & MOUSE_LEFT) { dnd_drop(x, y); dnd_active = 0; dnd_armed = 0; dnd_node = 0; }
+    } else if (dnd_armed && (b & MOUSE_LEFT)) {       /* armed: promote to a drag once it moves */
+        if (iabs(x - press_x) > 5 || iabs(y - press_y) > 5) { dnd_active = 1; dnd_px = x; dnd_py = y; }
+        if (up & MOUSE_LEFT) { dnd_armed = 0; dnd_node = 0; }
     } else if (down & MOUSE_LEFT) {
         on_left_down(x, y);
     }
+    if ((up & MOUSE_LEFT) && !dnd_active) { dnd_armed = 0; dnd_node = 0; }  /* armed click ended w/o a drag */
     prev_btns = b;
     dirty = 1;                                      /* cursor moved -> repaint */
 }
@@ -621,6 +806,7 @@ void gui_run(void) {
     console_detach();                                /* GUI owns the framebuffer now */
 
     terminal_app_init();
+    files_app_init();
     browser_app_init();
     taskmgr_app_init();
     settings_app_init();

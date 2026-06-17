@@ -5,11 +5,16 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
-export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
 
-NASM=/c/msys64/usr/bin/nasm.exe
-CLANG=/c/msys64/ucrt64/bin/clang.exe
-LLD=/c/msys64/ucrt64/bin/ld.lld.exe
+# Detect msys64 root path (works from msys2, Git Bash, and WSL)
+M=/c/msys64; [ -d "$M" ] || M=/mnt/c/msys64
+[ -d "$M" ] || { echo "ERROR: msys64 not found at /c/msys64 or /mnt/c/msys64"; exit 1; }
+
+export PATH="$M/ucrt64/bin:$M/usr/bin:$PATH"
+
+NASM=$M/usr/bin/nasm.exe
+CLANG=$M/ucrt64/bin/clang.exe
+LLD=$M/ucrt64/bin/ld.lld.exe
 
 CFLAGS=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie
         -mcmodel=kernel
@@ -37,7 +42,7 @@ SRCS=(
     net/wifi.c net/firmware.c drivers/e1000.c
     kernel/cmd_fs.c kernel/cmd_sys.c kernel/cmd_proc.c kernel/cmd_net.c kernel/cmd_extra.c
     kernel/html.c
-    kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c kernel/app_browser.c
+    kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c kernel/app_browser.c kernel/app_files.c
     kernel/settings.c
     fs/ramfs.c
     drivers/keyboard.c drivers/framebuffer.c drivers/mouse.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
@@ -74,7 +79,10 @@ dd if=build/kernel.bin   of="$IMG" bs=512 seek=33 conv=notrunc status=none
 echo "OK -> $IMG ($(stat -c %s "$IMG") bytes)"
 
 echo "[7/7] build bootable ISO"
-PYTHON=/c/Users/adria/AppData/Local/Programs/Python/Python311/python.exe
+P=/c/Users/adria/AppData/Local/Programs/Python/Python311/python.exe
+[ -f "$P" ] || P=/mnt/c/Users/adria/AppData/Local/Programs/Python/Python311/python.exe
+[ -f "$P" ] || { echo "ERROR: Python not found at /c/... or /mnt/c/..."; exit 1; }
+PYTHON=$P
 ISOPATH=iso/boltos.iso
 "$PYTHON" mkhpfs.py "$IMG" "$ISOPATH" "BoltOS"
 echo "OK -> $ISOPATH ($(stat -c %s "$ISOPATH") bytes)"

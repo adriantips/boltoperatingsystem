@@ -14,22 +14,37 @@ enum {
     HSTYLE_BOLD,
     HSTYLE_LINK,
     HSTYLE_PRE,
+    HSTYLE_ITALIC,
+    HSTYLE_CODE,
 };
 
+enum { HRUN_TEXT = 0, HRUN_IMG };
+enum { HALIGN_LEFT = 0, HALIGN_CENTER, HALIGN_RIGHT };
+
+#define HCOL_NONE 0u            /* run uses its style's default colour */
+
 typedef struct {
-    char    *text;       /* NUL-terminated, points into doc->arena */
+    char    *text;       /* NUL-terminated, points into doc->arena (text runs) */
     uint8_t  style;      /* HSTYLE_*                                */
     int      link;       /* index into doc->hrefs, or -1            */
-    uint8_t  brk;        /* 1 = start a new line before this run    */
+    uint8_t  brk;        /* 1 = line break before this run, 2 = paragraph gap */
+    uint8_t  kind;       /* HRUN_TEXT / HRUN_IMG                    */
+    uint8_t  align;      /* HALIGN_*                                */
+    uint8_t  indent;     /* indent level (lists / blockquote)       */
+    uint32_t color;      /* HCOL_NONE, or 0x1RRGGBB (high bit = set)*/
+    int      img;        /* index into doc->imgs, or -1 (image runs)*/
+    int      iw, ih;     /* width/height hints from attrs, 0 = none */
+    void    *pix;        /* decoded image_t*, filled by the browser */
 } html_run;
 
 typedef struct {
     html_run *runs;   int nruns;
     char    **hrefs;  int nhrefs;
+    char    **imgs;   int nimgs;       /* <img src> values            */
     char     *title;            /* page <title>, or NULL */
     /* private storage */
     char     *arena;  uint32_t arena_len, arena_cap;
-    int       runs_cap, hrefs_cap;
+    int       runs_cap, hrefs_cap, imgs_cap;
 } html_doc;
 
 /* Parse len bytes of HTML into a freshly allocated doc, or NULL on OOM. */

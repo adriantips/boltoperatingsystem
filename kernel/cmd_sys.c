@@ -8,6 +8,7 @@
 #include "kprintf.h"
 #include "string.h"
 #include "framebuffer.h"
+#include "ata.h"
 
 #define BOLT_VERSION "BoltOS 0.2"
 
@@ -131,8 +132,7 @@ int cmd_devices(int argc, char **argv) {
 /* ------------------------------ diskinfo --------------------------------- */
 int cmd_diskinfo(int argc, char **argv) {
     (void)argc; (void)argv;
-    kprintf("no block-device driver loaded.\n");
-    kprintf("boot   : BIOS INT 13h read the kernel from drive 0x80 (IDE).\n");
+
     struct pci_dev pds[32];
     int n = pci_scan(pds, 32), found = 0;
     for (int i = 0; i < n; i++) {
@@ -143,9 +143,36 @@ int cmd_diskinfo(int argc, char **argv) {
         }
     }
     if (!found) kprintf("ctrl   : (no PCI storage controller reported)\n");
+
+    int dn = ata_count();
+    kprintf("ATA disks: %d\n", dn);
+    for (int i = 0; i < dn; i++) {
+        ata_dev *d = ata_get(i);
+        char sz[12]; sh_human(d->sectors * ATA_SECTOR, sz);
+        kprintf("  [%d] %s  %s  %s  %s%s\n", i, ata_media(d), sz,
+                d->lba48 ? "lba48" : "lba28",
+                (d->io_base == 0x1F0 && d->slave == 0) ? "boot " : "",
+                d->model[0] ? d->model : "(disk)");
+    }
+
     char sz[12]; sh_human(fs_total_bytes(), sz);
-    kprintf("mounted: ramfs (in-RAM)  %d nodes  %s\n", fs_count_nodes(), sz);
+    if (fs_persist_active())
+        kprintf("mounted: BoltFS on %s '%s'  %d nodes  %s (persistent)\n",
+                fs_persist_media(), fs_persist_model(), fs_count_nodes(), sz);
+    else
+        kprintf("mounted: ramfs (in-RAM, volatile)  %d nodes  %s\n",
+                fs_count_nodes(), sz);
     return 0;
+}
+
+/* ------------------------------ sync ------------------------------------- */
+int cmd_sync(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (!fs_persist_active()) { kprintf("sync: no persistent disk; FS is RAM-only\n"); return 1; }
+    int rc = fs_sync();
+    kprintf(rc == 0 ? "sync: flushed FS to %s '%s'\n" : "sync: FAILED\n",
+            fs_persist_media(), fs_persist_model());
+    return rc == 0 ? 0 : 1;
 }
 
 /* ------------------------------ battery ---------------------------------- */

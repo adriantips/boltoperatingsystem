@@ -3,7 +3,24 @@
 A 64-bit operating system written from scratch in C and x86-64 assembly — no
 GRUB, no Multiboot, no external libraries. Custom MBR boot chain, own kernel.
 
-> Status: **active development.** Custom boot chain (stage1 → stage2 → long mode) into a 64-bit C kernel. Features include a framebuffer console, physical memory management, RAM filesystem, hardware interrupts, keyboard and mouse drivers, an interactive shell, a graphical user interface (GUI), an IPv4/TCP/UDP network stack with an e1000 NIC driver, and windowed apps (terminal, browser, taskmgr, settings).
+> Status: **active development.** Custom boot chain (stage1 → stage2 → long mode) into a 64-bit C kernel. Features include a framebuffer console, physical memory management, a **persistent filesystem on real ATA disks (HDD/SSD)**, hardware interrupts, keyboard and mouse drivers, an interactive shell, a graphical user interface (GUI), an IPv4/TCP/UDP network stack with an e1000 NIC driver, and windowed apps (terminal, browser, taskmgr, settings).
+
+## Storage (HDD / SSD)
+
+An **ATA/IDE PIO block driver** (`drivers/ata.c`) probes the legacy ATA register
+file on both channels (ports `0x1F0/0x3F6` and `0x170/0x376`), runs `IDENTIFY` on
+each slot, and supports LBA28/LBA48 sector read/write. The same command set drives
+both spinning **HDDs** and **SSDs**; the two are told apart from IDENTIFY word 217
+(nominal media rotation rate: `1` = non-rotating = SSD). ATAPI/CD-ROM slots are
+detected and skipped.
+
+The filesystem is no longer RAM-only: `fs_persist_init()` attaches the first
+non-boot ATA disk, **loads a saved BoltFS image on boot** (or formats the seed
+tree if none), and autosaves the whole tree on every mutation, so files survive
+reboots. The on-disk format is a superblock plus a serialised pre-order node
+list (`fs/ramfs.c`). `diskinfo` lists detected disks + media type; `sync` forces
+a flush. QEMU exposes two data disks (`run.sh`): one as an HDD
+(`rotation_rate=7200`), one as an SSD (`rotation_rate=1`).
 
 ## Web browser
 
@@ -65,8 +82,8 @@ bash run.sh        # boot in QEMU, kernel output on serial (stdio)
 ```
 boot/           Custom MBR bootloader (stage1, stage2)
 build/          Build outputs and OS image
-drivers/        Hardware drivers (framebuffer, keyboard, mouse)
-fs/             Filesystem implementations (RAMFS)
+drivers/        Hardware drivers (framebuffer, keyboard, mouse, ATA HDD/SSD)
+fs/             Filesystem (BoltFS: in-RAM tree, persisted to an ATA disk)
 include/        Kernel and system headers
 kernel/         Core kernel components (shell, GUI, interrupts, apps, etc.)
 libc/           Freestanding C library subset
@@ -91,7 +108,7 @@ The interactive OS shell supports a wide range of commands:
 
 - **File & Directory:** `ls`, `tree`, `cd`, `mkdir`, `rm`, `cp`, `mv`, `find`, `trash`, `recover`, `pwd`, `touch`, `write`
 - **File Inspection:** `cat`, `head`, `tail`, `hex`, `meta`, `diff`, `grep`, `checksum`, `preview`, `count`
-- **System Information:** `sysinfo`, `cpuinfo`, `meminfo`, `diskinfo`, `uptime`, `battery`, `sensors`, `devices`, `version`, `health`
+- **System Information:** `sysinfo`, `cpuinfo`, `meminfo`, `diskinfo`, `sync`, `uptime`, `battery`, `sensors`, `devices`, `version`, `health`
 - **Process Management:** `ps`, `kill`, `top`, `freeze`, `resume`, `services`, `service`, `jobs`, `priority`, `monitor`
 - **Networking:** `netinfo`, `ping`, `trace`, `ports`, `download`, `browse`, `upload`, `wifi`, `firewall`, `share`, `scan`
 - **Bonus / Unique:** `focus`, `snapshot`, `timeline`, `vault`, `doctor`, `assistant`, `sandbox`, `workspace`, `panic`, `story`

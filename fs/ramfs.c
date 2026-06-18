@@ -4,9 +4,16 @@
 #include "kheap.h"
 #include "string.h"
 #include "pit.h"
+#include "ata.h"
+#include "kprintf.h"
 
 static fs_node *root_;
 static fs_node *cwd_;
+
+/* persistence state (see bottom of file) */
+static ata_dev *g_disk;        /* backing disk, or 0 for RAM-only */
+static int      g_autosave;    /* flush on every mutation once mounted */
+static void     fs_autosave(void);
 
 /* --------------------------------------------------------------------------
  *  node allocation
@@ -124,7 +131,9 @@ fs_node *fs_create(const char *path, int is_dir) {
     if (!parent || !parent->is_dir) return 0;
     if (leaf[0] == 0) return 0;
     if (fs_child(parent, leaf)) return 0;       /* already exists */
-    return node_new(leaf, is_dir, parent);
+    fs_node *n = node_new(leaf, is_dir, parent);
+    if (n) fs_autosave();
+    return n;
 }
 
 /* --------------------------------------------------------------------------
@@ -150,6 +159,7 @@ int fs_remove_node(fs_node *n) {
     }
     if (cwd_ == n) cwd_ = parent ? parent : root_;
     node_free_tree(n);
+    fs_autosave();
     return 0;
 }
 
@@ -172,6 +182,7 @@ int fs_write(fs_node *n, const void *data, uint32_t len) {
     if (len) memcpy(n->data, data, len);
     n->size  = len;
     n->mtime = pit_ticks();
+    fs_autosave();
     return 0;
 }
 
@@ -189,6 +200,7 @@ int fs_append(fs_node *n, const void *data, uint32_t len) {
     if (len) memcpy(n->data + n->size, data, len);
     n->size  = need;
     n->mtime = pit_ticks();
+    fs_autosave();
     return 0;
 }
 
@@ -223,6 +235,7 @@ int fs_move(fs_node *n, fs_node *newparent, const char *newname) {
         while (c->next) c = c->next;
         c->next = n;
     }
+    fs_autosave();
     return 0;
 }
 
@@ -260,3 +273,192 @@ static int count_rec(fs_node *n) {
     return t;
 }
 int fs_count_nodes(void) { return root_ ? count_rec(root_) - 1 : 0; }
+
+/* ==========================================================================
+ *  Persistence  -  BoltFS on-disk image (serialised tree on a real ATA disk).
+ *
+ *  Layout:  sector 0 = superblock, sectors 1.. = a flat pre-order list of
+ *  node records (parent given by array index), file data inlined after each
+ *  file record. Whole image is rewritten on every mutation (autosave) - the
+ *  trees this OS holds are tiny, so simplicity beats journalling here.
+ * ==========================================================================*/
+#define BFS_MAGIC   "BOLTFS1"          /* 7 chars + NUL */
+#define BFS_NOPAR   0xFFFFFFFFu
+
+struct bfs_super {
+    char     magic[8];
+    uint32_t version;
+    uint32_t node_count;
+    uint64_t blob_bytes;
+    uint32_t checksum;                 /* sum32 over the blob */
+    uint32_t reserved;
+};
+
+struct bfs_rec {
+    uint32_t parent;                   /* index of parent record, BFS_NOPAR for root */
+    uint32_t is_dir;
+    uint32_t size;                     /* file data length (0 for dirs) */
+    uint32_t pad;
+    uint64_t mtime;
+    char     name[FS_NAME_MAX];
+};
+
+static void measure(fs_node *n, uint32_t *cnt, uint64_t *bytes) {
+    (*cnt)++;
+    *bytes += sizeof(struct bfs_rec) + (n->is_dir ? 0 : n->size);
+    for (fs_node *c = n->child; c; c = c->next) measure(c, cnt, bytes);
+}
+
+static uint32_t g_emit_idx;
+static void emit(fs_node *n, uint32_t parent_idx, uint8_t **pp) {
+    uint32_t myidx = g_emit_idx++;
+    struct bfs_rec r;
+    memset(&r, 0, sizeof r);
+    r.parent = parent_idx;
+    r.is_dir = (uint32_t)n->is_dir;
+    r.size   = n->is_dir ? 0 : n->size;
+    r.mtime  = n->mtime;
+    strncpy(r.name, n->name, FS_NAME_MAX);
+    memcpy(*pp, &r, sizeof r); *pp += sizeof r;
+    if (!n->is_dir && n->size) { memcpy(*pp, n->data, n->size); *pp += n->size; }
+    for (fs_node *c = n->child; c; c = c->next) emit(c, myidx, pp);
+}
+
+int fs_sync(void) {
+    if (!g_disk) return -1;
+
+    uint32_t cnt = 0; uint64_t blob = 0;
+    measure(root_, &cnt, &blob);
+
+    uint64_t sectors = 1 + (blob + ATA_SECTOR - 1) / ATA_SECTOR;
+    if (sectors > g_disk->sectors) {
+        kprintf("fs_sync: image (%lu sectors) exceeds disk (%lu)\n",
+                (unsigned long)sectors, (unsigned long)g_disk->sectors);
+        return -1;
+    }
+
+    uint64_t bufsz = sectors * ATA_SECTOR;
+    uint8_t *buf = (uint8_t *)kmalloc(bufsz);
+    if (!buf) return -1;
+    memset(buf, 0, bufsz);
+
+    uint8_t *p = buf + ATA_SECTOR;          /* blob starts after the superblock */
+    g_emit_idx = 0;
+    emit(root_, BFS_NOPAR, &p);
+
+    uint32_t sum = 0;
+    for (uint64_t i = 0; i < blob; i++) sum += buf[ATA_SECTOR + i];
+
+    struct bfs_super sb;
+    memset(&sb, 0, sizeof sb);
+    memcpy(sb.magic, BFS_MAGIC, 8);
+    sb.version    = 1;
+    sb.node_count = cnt;
+    sb.blob_bytes = blob;
+    sb.checksum   = sum;
+    memcpy(buf, &sb, sizeof sb);
+
+    int rc = ata_write(g_disk, 0, (uint32_t)sectors, buf);
+    kfree(buf);
+    return rc;
+}
+
+static void fs_autosave(void) { if (g_autosave) fs_sync(); }
+
+/* free every child of root (used before loading a saved image over the seed) */
+static void fs_clear(void) {
+    fs_node *c = root_->child;
+    while (c) { fs_node *nx = c->next; node_free_tree(c); c = nx; }
+    root_->child = 0;
+    cwd_ = root_;
+}
+
+static int fs_load_image(void) {
+    if (!g_disk) return -1;
+
+    uint8_t sec0[ATA_SECTOR];
+    if (ata_read(g_disk, 0, 1, sec0) != 0) return -1;
+    struct bfs_super *sb = (struct bfs_super *)sec0;
+    if (memcmp(sb->magic, BFS_MAGIC, 8) != 0) return -1;
+    if (sb->version != 1 || sb->node_count == 0) return -1;
+
+    uint64_t blob = sb->blob_bytes;
+    uint32_t cnt  = sb->node_count;
+    uint64_t sectors = (blob + ATA_SECTOR - 1) / ATA_SECTOR;
+    if (1 + sectors > g_disk->sectors || blob == 0) return -1;
+
+    uint8_t *buf = (uint8_t *)kmalloc(sectors * ATA_SECTOR);
+    if (!buf) return -1;
+    if (ata_read(g_disk, 1, (uint32_t)sectors, buf) != 0) { kfree(buf); return -1; }
+
+    uint32_t sum = 0;
+    for (uint64_t i = 0; i < blob; i++) sum += buf[i];
+    if (sum != sb->checksum) { kfree(buf); return -1; }
+
+    fs_node **map = (fs_node **)kmalloc(cnt * sizeof(fs_node *));
+    if (!map) { kfree(buf); return -1; }
+
+    fs_clear();
+
+    uint64_t off = 0;
+    int ok = 1;
+    for (uint32_t i = 0; i < cnt && ok; i++) {
+        if (off + sizeof(struct bfs_rec) > blob) { ok = 0; break; }
+        struct bfs_rec r;
+        memcpy(&r, buf + off, sizeof r);
+        off += sizeof r;
+        uint32_t dsize = r.is_dir ? 0 : r.size;
+        if (off + dsize > blob) { ok = 0; break; }
+
+        fs_node *n;
+        if (i == 0) {                               /* record 0 is the root */
+            n = root_;
+            strncpy(n->name, "/", FS_NAME_MAX);
+            n->is_dir = 1;
+            n->mtime  = r.mtime;
+        } else {
+            if (r.parent >= i) { ok = 0; break; }   /* parents precede children */
+            n = node_new(r.name, (int)r.is_dir, map[r.parent]);
+            if (!n) { ok = 0; break; }
+            n->mtime = r.mtime;
+            if (!r.is_dir && dsize) {
+                n->data = (uint8_t *)kmalloc(dsize);
+                if (!n->data) { ok = 0; break; }
+                memcpy(n->data, buf + off, dsize);
+                n->size = dsize;
+                n->cap  = dsize;
+            }
+        }
+        map[i] = n;
+        off += dsize;
+    }
+
+    kfree(map);
+    kfree(buf);
+    if (!ok) { fs_clear(); return -1; }
+    return 0;
+}
+
+void fs_persist_init(void) {
+    g_disk = ata_fs_disk();
+    if (!g_disk) {
+        kprintf("[--] fs: no data disk found; RAM-only (volatile)\n");
+        return;
+    }
+
+    if (fs_load_image() == 0) {
+        kprintf("[ok] fs: loaded image from %s '%s' (%d nodes)\n",
+                ata_media(g_disk), g_disk->model[0] ? g_disk->model : "disk",
+                fs_count_nodes());
+    } else {
+        kprintf("[ok] fs: formatting %s '%s' with seed tree\n",
+                ata_media(g_disk), g_disk->model[0] ? g_disk->model : "disk");
+    }
+
+    g_autosave = 1;
+    fs_sync();                  /* persist current tree (loaded or freshly seeded) */
+}
+
+int fs_persist_active(void) { return g_disk != 0; }
+const char *fs_persist_media(void) { return g_disk ? ata_media(g_disk) : ""; }
+const char *fs_persist_model(void) { return g_disk ? g_disk->model : ""; }

@@ -70,6 +70,32 @@ static void find_header(const char *hdr, const char *name, char *out, uint32_t c
     }
 }
 
+/* in-place decode of an HTTP/1.1 "Transfer-Encoding: chunked" body. Returns the
+ * decoded length. Tolerant of chunk extensions and a missing final CRLF. */
+static int dechunk(char *buf, uint32_t len) {
+    uint32_t r = 0, w = 0;
+    while (r < len) {
+        uint32_t sz = 0; int any = 0;
+        while (r < len) {
+            char ch = buf[r];
+            int dv = (ch >= '0' && ch <= '9') ? ch - '0'
+                   : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10
+                   : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10 : -1;
+            if (dv < 0) break;
+            sz = sz * 16 + (uint32_t)dv; r++; any = 1;
+        }
+        while (r < len && buf[r] != '\n') r++;     /* skip extensions + CR */
+        if (r < len) r++;                          /* the \n */
+        if (!any || sz == 0) break;                /* malformed or last chunk */
+        if (r + sz > len) sz = len - r;
+        memmove(buf + w, buf + r, sz); w += sz; r += sz;
+        if (r < len && buf[r] == '\r') r++;
+        if (r < len && buf[r] == '\n') r++;
+    }
+    buf[w] = 0;
+    return (int)w;
+}
+
 int http_get(const char *url, char *out, uint32_t cap,
              int *status, char *location, uint32_t loc_cap) {
     char host[128], path[512];
@@ -117,16 +143,21 @@ int http_get(const char *url, char *out, uint32_t cap,
 
     /* split headers / body at the blank line */
     char *body = out;
+    int chunked = 0;
     for (uint32_t i = 0; i + 3 < total; i++) {
         if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' && out[i + 3] == '\n') {
             out[i] = 0;                 /* terminate header block for find_header */
             body = out + i + 4;
             if (location) find_header(out, "Location", location, loc_cap);
+            char te[32]; find_header(out, "Transfer-Encoding", te, sizeof(te));
+            for (char *p = te; *p; p++) { char a = *p; if (a >= 'A' && a <= 'Z') a += 32;
+                if (a == 'c' && (p == te || p[-1] == ' ' || p[-1] == ',')) { chunked = 1; break; } }
             break;
         }
     }
     uint32_t blen = total - (uint32_t)(body - out);
     memmove(out, body, blen);
     out[blen] = 0;
+    if (chunked) blen = (uint32_t)dechunk(out, blen);
     return (int)blen;
 }

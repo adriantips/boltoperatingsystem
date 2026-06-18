@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "gui.h"
 #include "html.h"
+#include "image.h"
 #include "http.h"
 #include "net.h"
 #include "netif.h"
@@ -23,6 +24,10 @@
 #define SBW        12
 #define MAXHIST    24
 #define HTTP_CAP   (256 * 1024)
+#define IMG_FETCH_CAP (1536 * 1024)   /* per-image download buffer            */
+#define IMG_BUDGET    (7 * 1024 * 1024) /* total resident decoded-image budget */
+#define MAXIMG     256
+#define INDENT_STEP 22
 
 typedef struct { int x, y, w, h, link; } hitrect;
 
@@ -39,6 +44,8 @@ typedef struct {
     int       nhits;
     char      history[MAXHIST][256];
     int       histlen;
+    image_t  *owned[MAXIMG];   /* decoded images backing the current doc */
+    int       nowned;
 } browser_t;
 
 static browser_t B;
@@ -54,67 +61,146 @@ static void sappend(char *d, const char *s, uint32_t cap) {
 static void set_status(browser_t *st, const char *s) { scopy(st->status, s, sizeof(st->status)); }
 
 /* ---- style metrics ----------------------------------------------------- */
-static void metrics(uint8_t style, int *scale, int *lh, uint32_t *col) {
+static void metrics(uint8_t style, int *scale, int *lh, uint32_t *col, int *italic) {
+    *italic = 0;
     switch (style) {
-    case HSTYLE_H1: *scale = 2; *lh = 34; *col = 0xFFFFFF; break;
-    case HSTYLE_H2: *scale = 2; *lh = 28; *col = 0xF0F0F4; break;
-    case HSTYLE_H3: *scale = 1; *lh = 22; *col = 0xFFFFFF; break;
-    case HSTYLE_BOLD:*scale = 1; *lh = 16; *col = 0xFFFFFF; break;
-    case HSTYLE_LINK:*scale = 1; *lh = 16; *col = COL_ACCENT; break;
-    case HSTYLE_PRE: *scale = 1; *lh = 16; *col = 0x9FE0A0; break;
-    default:         *scale = 1; *lh = 16; *col = 0xC8C8D0; break;
+    case HSTYLE_H1: *scale = 2; *lh = 36; *col = 0xFFFFFF; break;
+    case HSTYLE_H2: *scale = 2; *lh = 30; *col = 0xF0F0F4; break;
+    case HSTYLE_H3: *scale = 1; *lh = 24; *col = 0xFFFFFF; break;
+    case HSTYLE_BOLD:*scale = 1; *lh = 18; *col = 0xFFFFFF; break;
+    case HSTYLE_LINK:*scale = 1; *lh = 18; *col = COL_ACCENT; break;
+    case HSTYLE_PRE: *scale = 1; *lh = 17; *col = 0x9FE0A0; break;
+    case HSTYLE_CODE:*scale = 1; *lh = 18; *col = 0x9FE0A0; break;
+    case HSTYLE_ITALIC:*scale = 1; *lh = 18; *col = 0xC8C8D0; *italic = 1; break;
+    default:         *scale = 1; *lh = 18; *col = 0xC8C8D0; break;
     }
 }
 
 /* ---- layout + paint of the page body ----------------------------------- *
- * One pass over the run list, word-wrapping into the content rect. When draw
- * is 0 it only measures (to learn total height); when 1 it paints and records
- * link hit rects. Coordinates are client-relative; cx/cy add the window origin. */
+ * Line-based: words and images accumulate into a line buffer, then each line is
+ * flushed with its alignment (left/center/right) and indent applied. Supports
+ * per-run colour, headings, links and inline/block images. When draw is 0 it
+ * only measures (to learn total height); when 1 it paints + records hit rects.
+ * Coordinates are client-relative; cx/cy add the window origin. */
+typedef struct {
+    int      x, w, scale, lh;
+    uint32_t color;
+    int      link;
+    const char *text; int len;     /* text item */
+    int      is_img; image_t *pix; int dw, dh; /* image item */
+    int      italic;
+} litem;
+
+#define MAXLINE 320
+static litem LINE[MAXLINE];
+
+static void emit_line(browser_t *st, int cx, int cy, int draw, int *pen_y,
+                      int n, int line_h, int xstart, int avail, uint8_t align, int Y0, int Yb) {
+    int py = *pen_y;
+    if (n > 0) {
+        int linew = LINE[n-1].x + LINE[n-1].w;
+        int off = 0;
+        if (align == HALIGN_CENTER)      off = (avail - linew) / 2;
+        else if (align == HALIGN_RIGHT)  off = avail - linew;
+        if (off < 0) off = 0;
+        if (draw && py + line_h >= Y0 && py <= Yb) {
+            for (int k = 0; k < n; k++) {
+                litem *it = &LINE[k];
+                int ax = cx + xstart + off + it->x;
+                if (it->is_img) {
+                    if (it->pix) g_blit(ax, cy + py, it->dw, it->dh, it->pix->px, it->pix->w, it->pix->h);
+                    else {
+                        g_rect(ax, cy + py, it->dw, it->dh, 0x55556A);
+                        g_text(ax + 4, cy + py + it->dh/2 - 4, it->text, COL_TEXT_DIM, 1);
+                    }
+                    if (it->link >= 0 && st->nhits < (int)(sizeof(st->hits)/sizeof(st->hits[0])))
+                        st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->dw, it->dh, it->link };
+                } else {
+                    g_text_pn(ax, cy + py, it->text, it->len, it->color, it->scale, it->italic);
+                    if (it->link >= 0) {
+                        g_hline(ax, cy + py + 8 * it->scale + 1, it->w, it->color);
+                        if (st->nhits < (int)(sizeof(st->hits)/sizeof(st->hits[0])))
+                            st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->w, line_h, it->link };
+                    }
+                }
+            }
+        }
+        *pen_y = py + line_h;
+    }
+}
+
 static void layout(browser_t *st, int cx, int cy, int draw) {
     int X0 = 10, Xr = st->cw - SBW - 12;
     int Y0 = TOOLBAR_H + 4, Yb = st->ch - STATUS_H - 2;
-    if (Xr < X0 + 40) Xr = X0 + 40;
-
+    if (Xr < X0 + 60) Xr = X0 + 60;
     if (draw) st->nhits = 0;
-    int pen_x = X0, pen_y = Y0 - st->scroll, line_h = 16;
+
+    int pen_y = Y0 - st->scroll;
+    int n = 0, cur_x = 0, line_h = 0;
+    int xstart = X0, avail = Xr - X0;
+    uint8_t align = HALIGN_LEFT;
 
     html_doc *d = st->doc;
     for (int ri = 0; d && ri < d->nruns; ri++) {
         html_run *r = &d->runs[ri];
-        int scale, lh; uint32_t col;
-        metrics(r->style, &scale, &lh, &col);
-        int sw = 8 * scale;
+        int scale, lh, italic; uint32_t dcol;
+        metrics(r->style, &scale, &lh, &dcol, &italic);
+        uint32_t color = (r->color & 0x1000000) ? (r->color & 0xFFFFFF) : dcol;
 
         if (r->brk) {
-            pen_y += line_h;
-            if (r->brk >= 2) pen_y += line_h / 2;
-            pen_x = X0; line_h = lh;
+            if (n > 0) emit_line(st, cx, cy, draw, &pen_y, n, line_h, xstart, avail, align, Y0, Yb);
+            else       pen_y += 16;
+            if (r->brk >= 2) pen_y += 8;
+            n = 0; cur_x = 0; line_h = 0;
         }
-        if (lh > line_h) line_h = lh;
 
+        align  = r->align;
+        xstart = X0 + r->indent * INDENT_STEP;
+        avail  = Xr - xstart; if (avail < 60) avail = 60;
+
+        if (r->kind == HRUN_IMG) {
+            image_t *im = r->pix;
+            int dw = im ? im->w : (r->iw > 0 ? r->iw : 140);
+            int dh = im ? im->h : (r->ih > 0 ? r->ih : 90);
+            if (dw > avail) { dh = dh * avail / (dw ? dw : 1); dw = avail; }
+            if (dw < 1) dw = 1; if (dh < 1) dh = 1;
+            if (cur_x > 0 && cur_x + dw > avail) {
+                emit_line(st, cx, cy, draw, &pen_y, n, line_h, xstart, avail, align, Y0, Yb);
+                n = 0; cur_x = 0; line_h = 0;
+            }
+            if (n < MAXLINE) {
+                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, (int)strlen(r->text), 1, im, dw, dh, 0 };
+                n++;
+            }
+            cur_x += dw + 4;
+            if (dh > line_h) line_h = dh;
+            continue;
+        }
+
+        int spacew = g_glyph_adv(' ', scale);
         const char *s = r->text;
         while (*s) {
-            while (*s == ' ') { pen_x += sw; s++; if (pen_x > Xr) { pen_y += line_h; pen_x = X0; line_h = lh; } }
+            while (*s == ' ') s++;
             if (!*s) break;
             const char *w = s; int wl = 0;
             while (*s && *s != ' ') { s++; wl++; }
-            int ww = wl * sw;
-            if (pen_x + ww > Xr && pen_x > X0) { pen_y += line_h; pen_x = X0; line_h = lh; }
-            if (lh > line_h) line_h = lh;
-
-            if (draw && pen_y + lh >= Y0 && pen_y <= Yb) {
-                int ax = cx + pen_x, ay = cy + pen_y;
-                for (int k = 0; k < wl; k++) g_char(ax + k * sw, ay, w[k], col, scale);
-                if (r->style == HSTYLE_LINK) {
-                    g_hline(ax, ay + 8 * scale + 1, ww, col);
-                    if (st->nhits < (int)(sizeof(st->hits) / sizeof(st->hits[0])))
-                        st->hits[st->nhits++] = (hitrect){ pen_x, pen_y, ww, lh, r->link };
-                }
+            int ww = g_text_width_pn(w, wl, scale);
+            int space = cur_x > 0 ? spacew : 0;
+            if (cur_x > 0 && cur_x + space + ww > avail) {
+                emit_line(st, cx, cy, draw, &pen_y, n, line_h, xstart, avail, align, Y0, Yb);
+                n = 0; cur_x = 0; line_h = 0; space = 0;
             }
-            pen_x += ww;
+            cur_x += space;
+            if (n < MAXLINE) {
+                LINE[n] = (litem){ cur_x, ww, scale, lh, color, r->link, w, wl, 0, 0, 0, 0, italic };
+                n++;
+            }
+            cur_x += ww;
+            if (lh > line_h) line_h = lh;
         }
     }
-    st->content_h = (pen_y + st->scroll + line_h) - Y0;   /* total, scroll-independent */
+    if (n > 0) emit_line(st, cx, cy, draw, &pen_y, n, line_h, xstart, avail, align, Y0, Yb);
+    st->content_h = (pen_y + st->scroll) - Y0;
 }
 
 /* ---- URL / link resolution --------------------------------------------- */
@@ -165,6 +251,62 @@ static int ends_with(const char *s, const char *suf) {
 
 static void load_url(browser_t *st, const char *url, int depth);
 
+/* ---- image fetching ---------------------------------------------------- */
+static void free_images(browser_t *st) {
+    for (int i = 0; i < st->nowned; i++) if (st->owned[i]) image_free(st->owned[i]);
+    st->nowned = 0;
+}
+
+static image_t *fetch_one(browser_t *st, const char *src) {
+    char url[300]; resolve_link(st, src, url, sizeof(url));
+    const uint8_t *data = 0; uint32_t dlen = 0; uint8_t *buf = 0; image_t *im = 0;
+    if (is_remote(url)) {
+        buf = (uint8_t *)kmalloc(IMG_FETCH_CAP);
+        if (!buf) return 0;
+        int code = 0; char loc[256];
+        int blen = http_get(url, (char *)buf, IMG_FETCH_CAP, &code, loc, sizeof(loc));
+        if (code >= 300 && code < 400 && loc[0]) {     /* one redirect hop */
+            char rurl[300]; resolve_link(st, loc, rurl, sizeof(rurl));
+            blen = http_get(rurl, (char *)buf, IMG_FETCH_CAP, &code, loc, sizeof(loc));
+        }
+        if (blen > 0) { data = buf; dlen = (uint32_t)blen; }
+    } else {
+        const char *p = url; if (strncmp(p, "file:", 5) == 0) p += 5;
+        fs_node *nf = fs_lookup(p);
+        if (nf && !nf->is_dir) { data = nf->data; dlen = nf->size; }
+    }
+    if (data) im = image_decode(data, dlen);
+    if (buf) kfree(buf);
+    return im;
+}
+
+/* Resolve, download and decode every <img> in the current doc; wire decoded
+ * pixels back onto the runs. Bounded by a count and a resident-memory budget. */
+static void fetch_images(browser_t *st) {
+    html_doc *d = st->doc;
+    if (!d || d->nimgs == 0) return;
+    image_t **cache = (image_t **)kmalloc((uint32_t)d->nimgs * sizeof(image_t *));
+    if (!cache) return;
+    for (int i = 0; i < d->nimgs; i++) cache[i] = 0;
+
+    uint32_t budget = 0;
+    for (int i = 0; i < d->nimgs; i++) {
+        if (st->nowned >= MAXIMG || budget >= IMG_BUDGET) break;
+        set_status(st, "Loading images...");
+        gui_pump();                                   /* keep the UI alive */
+        image_t *im = fetch_one(st, d->imgs[i]);
+        if (im) {
+            cache[i] = im;
+            st->owned[st->nowned++] = im;
+            budget += (uint32_t)im->w * im->h * 4;
+        }
+    }
+    for (int ri = 0; ri < d->nruns; ri++)
+        if (d->runs[ri].kind == HRUN_IMG && d->runs[ri].img >= 0 && d->runs[ri].img < d->nimgs)
+            d->runs[ri].pix = cache[d->runs[ri].img];
+    kfree(cache);
+}
+
 static int load_http(browser_t *st, const char *url, int depth) {
     set_status(st, "Connecting...");
     char *buf = (char *)kmalloc(HTTP_CAP);
@@ -187,11 +329,13 @@ static int load_http(browser_t *st, const char *url, int depth) {
         return 1;
     }
 
+    free_images(st);
     if (st->doc) { html_free(st->doc); st->doc = 0; }
     st->doc = html_parse(buf, (uint32_t)blen);
     kfree(buf);
     st->scroll = 0;
     scopy(st->url, url, sizeof(st->url));
+    fetch_images(st);
 
     char num[16]; sh_utoa((uint64_t)blen, num);
     char s[120]; s[0] = 0;
@@ -211,6 +355,7 @@ static int load_fs(browser_t *st, const char *path) {
     if (!n) { char s[120]; s[0]=0; sappend(s,"not found: ",sizeof(s)); sappend(s,p,sizeof(s)); set_status(st, s); return 0; }
     if (n->is_dir) { set_status(st, "that is a directory, not a file"); return 0; }
 
+    free_images(st);
     if (st->doc) { html_free(st->doc); st->doc = 0; }
     if (ends_with(n->name, ".html") || ends_with(n->name, ".htm"))
         st->doc = html_parse((const char *)n->data, n->size);
@@ -218,6 +363,7 @@ static int load_fs(browser_t *st, const char *path) {
         st->doc = html_parse_text((const char *)n->data, n->size);
     st->scroll = 0;
     scopy(st->url, p, sizeof(st->url));
+    fetch_images(st);
     scopy(BW->title, n->name, sizeof(BW->title));
 
     char num[16]; sh_utoa((uint64_t)n->size, num);
@@ -405,6 +551,16 @@ static const char WELCOME[] =
     "<li>Scroll with the scrollbar, or Space / b, or the j / k keys</li>"
     "<li>Click <b>&lt;</b> to go back</li>"
     "</ul>"
+    "<h2>Rendering</h2>"
+    "<p>The engine decodes <b>PNG</b>, <b>JPEG</b>, <b>GIF</b> and <b>BMP</b> images, "
+    "and lays out proportional text with <b>bold</b>, <i>italic</i>, "
+    "<code>monospace code</code> and "
+    "<font color=\"#e06060\">in</font><font color=\"#60c060\">line</font> "
+    "<font color=\"#6090e0\">colour</font>, headings, lists, blockquotes and "
+    "alignment. UTF-8 is decoded too &mdash; accents fold to ASCII "
+    "(caf&eacute;, na&iuml;ve) and &ldquo;smart quotes&rdquo; render.</p>"
+    "<center><p>This paragraph is centred.</p></center>"
+    "<p><img src=\"/web/logo.bmp\" alt=\"a generated gradient\"></p>"
     "<h2>Notes</h2>"
     "<p>The data path uses the e1000 NIC (the link QEMU/VirtualBox NAT exposes). "
     "Wi-Fi association is scaffolded in the kernel but needs a radio driver; see "
@@ -415,17 +571,54 @@ static const char SAMPLE[] =
     "<h1>Hello from the ramfs</h1>"
     "<p>This file lives at <b>/web/index.html</b> and is rendered by the BoltOS "
     "HTML engine without touching the network.</p>"
+    "<p><img src=\"/web/logo.bmp\" alt=\"a generated gradient\"></p>"
     "<h3>A short list</h3>"
-    "<ul><li>headings</li><li>paragraphs</li><li>links and <b>bold</b> text</li></ul>"
+    "<ul><li>headings</li><li>paragraphs</li>"
+    "<li><font color=\"red\">coloured</font> links and <b>bold</b> text</li></ul>"
+    "<blockquote>Block quotes indent their text from the left margin.</blockquote>"
     "<p>Back to the <a href=\"/web/index.html\">start</a> or visit "
     "<a href=\"http://example.com\">example.com</a>.</p>";
 
+/* generate a small 24-bit BMP so the sample page has a real image to decode */
+static void seed_logo(void) {
+    if (fs_lookup("/web/logo.bmp")) return;
+    int w = 160, h = 70;
+    uint32_t rowsz = ((uint32_t)w * 3 + 3) & ~3u, dsz = rowsz * h, fsz = 54 + dsz;
+    uint8_t *bmp = (uint8_t *)kmalloc(fsz);
+    if (!bmp) return;
+    memset(bmp, 0, fsz);
+    bmp[0] = 'B'; bmp[1] = 'M';
+    *(uint32_t *)(bmp + 2)  = fsz;
+    *(uint32_t *)(bmp + 10) = 54;
+    *(uint32_t *)(bmp + 14) = 40;
+    *(int32_t  *)(bmp + 18) = w;
+    *(int32_t  *)(bmp + 22) = h;
+    *(uint16_t *)(bmp + 26) = 1;
+    *(uint16_t *)(bmp + 28) = 24;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = bmp + 54 + (uint32_t)y * rowsz;
+        for (int x = 0; x < w; x++) {
+            uint8_t *p = row + x * 3;        /* BGR, bottom-up */
+            p[0] = (uint8_t)(60 + x * 160 / w);   /* B */
+            p[1] = (uint8_t)(y * 200 / h);        /* G */
+            p[2] = (uint8_t)(200 - x * 120 / w);  /* R */
+        }
+    }
+    fs_node *f = fs_create("/web/logo.bmp", 0);
+    if (f) fs_write(f, bmp, fsz);
+    kfree(bmp);
+}
+
 static void seed_sample_file(void) {
-    if (fs_lookup("/web")) return;
-    fs_node *dir = fs_create("/web", 1);
-    if (!dir) return;
-    fs_node *f = fs_create("/web/index.html", 0);
-    if (f) fs_write(f, SAMPLE, (uint32_t)(sizeof(SAMPLE) - 1));
+    if (!fs_lookup("/web")) {
+        fs_node *dir = fs_create("/web", 1);
+        if (!dir) return;
+    }
+    if (!fs_lookup("/web/index.html")) {
+        fs_node *f = fs_create("/web/index.html", 0);
+        if (f) fs_write(f, SAMPLE, (uint32_t)(sizeof(SAMPLE) - 1));
+    }
+    seed_logo();
 }
 
 void browser_app_init(void) {
@@ -439,8 +632,9 @@ void browser_app_init(void) {
     w->key   = browser_key;
     w->click = browser_click;
 
-    B.doc = html_parse(WELCOME, (uint32_t)(sizeof(WELCOME) - 1));
     scopy(B.url, "about:welcome", sizeof(B.url));
+    B.doc = html_parse(WELCOME, (uint32_t)(sizeof(WELCOME) - 1));
+    fetch_images(&B);
     scopy(B.addr, "", sizeof(B.addr));
     set_status(&B, "Welcome - enter a URL or open a local file");
 }

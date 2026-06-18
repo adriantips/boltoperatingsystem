@@ -41,3 +41,15 @@ void     fs_abspath(fs_node *n, char *out, uint32_t cap);
 
 uint64_t fs_total_bytes(void);
 int      fs_count_nodes(void);
+
+/* --------------------------------------------------------------------------
+ *  Persistence: back the tree with a real ATA disk (SSD/HDD). fs_persist_init
+ *  attaches the data disk, loads a saved image if one is present (else formats
+ *  the current seeded tree onto it), and enables autosave so every mutation is
+ *  flushed. Without a data disk the FS stays RAM-only and these are no-ops.
+ * --------------------------------------------------------------------------*/
+void     fs_persist_init(void);              /* call once, after ata_init() */
+int      fs_sync(void);                      /* flush whole tree; 0 ok, -1 err */
+int      fs_persist_active(void);            /* 1 if backed by a real disk */
+const char *fs_persist_media(void);          /* "SSD"/"HDD"/"" */
+const char *fs_persist_model(void);          /* disk model, or "" */

@@ -21,6 +21,7 @@
 #include "keyboard.h"
 #include "mouse.h"
 #include "fs.h"
+#include "ata.h"
 #include "sysreg.h"
 #include "sched.h"
 #include "shell.h"
@@ -87,7 +88,9 @@ void kmain(struct bootinfo *bi) {
     sti();
     kprintf("[ok] interrupts enabled\n");
 
+    ata_init();      /* probe ATA disks (HDD/SSD) before the FS attaches */
     fs_init();       kprintf("[ok] ramfs mounted (/)\n");
+    fs_persist_init();/* back the tree with a real disk + load saved image */
     sysreg_init();   kprintf("[ok] service + task registry\n");
     net_init();      /* netif core + NIC driver probe (e1000 under QEMU) */
 

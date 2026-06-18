@@ -45,6 +45,14 @@ void g_round(int x, int y, int w, int h, int r, uint32_t color, uint8_t alpha); 
 void g_char (int x, int y, char c, uint32_t color, int scale);
 void g_text (int x, int y, const char *s, uint32_t color, int scale);
 int  g_text_width(const char *s, int scale);
+/* proportional (variable-width) text: glyphs are trimmed to their ink box plus a
+ * 1px gap, so prose reads like a real font instead of a monospace grid. italic
+ * shears each row. The UI/terminal keep the monospace g_* calls above. */
+int  g_glyph_adv(char c, int scale);                                   /* advance width of one glyph */
+void g_char_p(int x, int y, char c, uint32_t color, int scale, int italic);
+int  g_text_width_pn(const char *s, int len, int scale);
+int  g_text_pn(int x, int y, const char *s, int len, uint32_t color, int scale, int italic); /* -> end x */
+void g_blit(int dx, int dy, int dw, int dh, const uint32_t *src, int sw, int sh); /* ARGB, scaled */
 void g_set_clip(int x, int y, int w, int h);
 void g_clear_clip(void);
 void gui_icon(int id, int x, int y, int scale, uint32_t color);   /* draw an ICON_* glyph */

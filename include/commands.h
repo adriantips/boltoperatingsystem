@@ -45,7 +45,7 @@ int cmd_count(int, char **);
 int cmd_sysinfo(int, char **);int cmd_cpuinfo(int, char **);int cmd_meminfo(int, char **);
 int cmd_diskinfo(int, char **);int cmd_uptime(int, char **);int cmd_battery(int, char **);
 int cmd_sensors(int, char **);int cmd_devices(int, char **);int cmd_version(int, char **);
-int cmd_health(int, char **);
+int cmd_health(int, char **); int cmd_sync(int, char **);
 
 /* ---- handlers: Process Management --------------------------------------- */
 int cmd_ps(int, char **);     int cmd_kill(int, char **);   int cmd_top(int, char **);

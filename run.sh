@@ -13,8 +13,14 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 # Convert ROOT to Windows path when under WSL (QEMU is a Windows exe)
 command -v wslpath &>/dev/null && ROOT=$(wslpath -w "$ROOT")
 exec "$QEMU" \
-    -drive file="$ROOT/iso/os.img",format=raw,if=ide \
-    -drive file="$ROOT/iso/boltos.iso",if=ide,media=cdrom \
+    -drive id=boot,file="$ROOT/iso/os.img",format=raw,if=none \
+    -device ide-hd,drive=boot,bus=ide.0,unit=0 \
+    -drive id=cd,file="$ROOT/iso/boltos.iso",format=raw,if=none \
+    -device ide-cd,drive=cd,bus=ide.0,unit=1 \
+    -drive id=hdd,file="$ROOT/iso/disk-hdd.img",format=raw,if=none \
+    -device ide-hd,drive=hdd,bus=ide.1,unit=0,rotation_rate=7200 \
+    -drive id=ssd,file="$ROOT/iso/disk-ssd.img",format=raw,if=none \
+    -device ide-hd,drive=ssd,bus=ide.1,unit=1,rotation_rate=1 \
     -boot order=c \
     -m 512M \
     -netdev user,id=net0 \

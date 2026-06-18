@@ -124,6 +124,70 @@ void g_text(int x, int y, const char *str, uint32_t color, int s) {
 }
 int g_text_width(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
 
+/* ---- proportional text -------------------------------------------------- *
+ * Per-glyph metrics are derived once from the bitmap font: the ink box (first
+ * and last lit column) gives a left bearing and a tight advance; blanks get a
+ * fixed word-space. Glyphs are drawn left-trimmed to their ink so spacing is
+ * even. Used by the browser body for prose; the rest of the UI stays monospace.*/
+static int gp_adv[128], gp_minc[128], gp_ready = 0;
+static void gp_build(void) {
+    for (int u = 0; u < 128; u++) {
+        const unsigned char *g = font8x8_basic[u];
+        int minc = 8, maxc = -1;
+        for (int ry = 0; ry < 8; ry++) {
+            unsigned char b = g[ry];
+            for (int rx = 0; rx < 8; rx++) if (b & (1u << rx)) { if (rx < minc) minc = rx; if (rx > maxc) maxc = rx; }
+        }
+        if (maxc < 0) { gp_adv[u] = 4; gp_minc[u] = 0; }      /* space / blank glyph */
+        else          { gp_adv[u] = (maxc - minc + 1) + 1; gp_minc[u] = minc; }
+    }
+    gp_ready = 1;
+}
+int g_glyph_adv(char c, int scale) {
+    unsigned char u = (unsigned char)c; if (u >= 128) u = '?';
+    if (!gp_ready) gp_build();
+    return gp_adv[u] * scale;
+}
+void g_char_p(int x, int y, char ch, uint32_t color, int s, int italic) {
+    unsigned char u = (unsigned char)ch; if (u >= 128) u = '?';
+    if (!gp_ready) gp_build();
+    const unsigned char *g = font8x8_basic[u];
+    int minc = gp_minc[u];
+    for (int ry = 0; ry < 8; ry++) {
+        unsigned char bits = g[ry];
+        int sk = italic ? ((7 - ry) * s) / 3 : 0;            /* fake-italic shear */
+        for (int rx = 0; rx < 8; rx++)
+            if (bits & (1u << rx)) g_fill(x + (rx - minc) * s + sk, y + ry * s, s, s, color);
+    }
+}
+int g_text_width_pn(const char *s, int len, int scale) {
+    int w = 0; for (int i = 0; i < len; i++) w += g_glyph_adv(s[i], scale); return w;
+}
+int g_text_pn(int x, int y, const char *s, int len, uint32_t color, int scale, int italic) {
+    for (int i = 0; i < len; i++) { g_char_p(x, y, s[i], color, scale, italic); x += g_glyph_adv(s[i], scale); }
+    return x;
+}
+
+/* Blit a w*h ARGB image into the dst rectangle, nearest-neighbour scaled and
+ * alpha-blended against the backbuffer. Honours the active clip rect. */
+void g_blit(int dx, int dy, int dw, int dh, const uint32_t *src, int sw, int sh) {
+    if (!src || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
+    int x0 = imax(dx, clx0), y0 = imax(dy, cly0);
+    int x1 = imin(dx + dw, clx1), y1 = imin(dy + dh, cly1);
+    for (int y = y0; y < y1; y++) {
+        int sy = (y - dy) * sh / dh; if (sy >= sh) sy = sh - 1;
+        const uint32_t *srow = src + sy * sw;
+        for (int x = x0; x < x1; x++) {
+            int sx = (x - dx) * sw / dw; if (sx >= sw) sx = sw - 1;
+            uint32_t c = srow[sx];
+            uint8_t a = c >> 24;
+            if (a == 255)      BB[y * W + x] = c & 0xFFFFFF;
+            else if (a == 0)   continue;
+            else               px_blend(x, y, c & 0xFFFFFF, a);
+        }
+    }
+}
+
 /* ===========================================================================
  *  Desktop wallpaper
  * ===========================================================================*/

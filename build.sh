@@ -41,13 +41,13 @@ SRCS=(
     net/tcp.c net/dns.c net/crypto.c net/tls.c net/http.c
     net/wifi.c net/firmware.c drivers/e1000.c
     kernel/cmd_fs.c kernel/cmd_sys.c kernel/cmd_proc.c kernel/cmd_net.c kernel/cmd_extra.c
-    kernel/html.c
+    kernel/html.c kernel/image.c
     kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c kernel/app_browser.c kernel/app_files.c
     kernel/app_python.c
     kernel/settings.c
     kernel/boltpy.c kernel/cmd_python.c
     fs/ramfs.c
-    drivers/keyboard.c drivers/framebuffer.c drivers/mouse.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
+    drivers/keyboard.c drivers/framebuffer.c drivers/mouse.c drivers/ata.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
 )
 KOBJS=(build/kboot.o build/isr.o)
 for c in "${SRCS[@]}"; do
@@ -79,6 +79,18 @@ dd if=build/stage2.bin   of="$IMG" bs=512 seek=1  conv=notrunc status=none
 dd if=build/kernel.bin   of="$IMG" bs=512 seek=33 conv=notrunc status=none
 
 echo "OK -> $IMG ($(stat -c %s "$IMG") bytes)"
+
+# Persistent data disks for the filesystem. Created once and left alone on
+# rebuilds so files survive across runs. One is presented to QEMU as a spinning
+# HDD, the other as an SSD (rotation_rate flag in run.sh) - the ATA driver tells
+# them apart from the IDENTIFY page. 64 MiB each.
+DATA_MB=64
+for d in iso/disk-hdd.img iso/disk-ssd.img; do
+    if [ ! -f "$d" ]; then
+        dd if=/dev/zero of="$d" bs=1M count="$DATA_MB" status=none
+        echo "created $d (${DATA_MB} MiB)"
+    fi
+done
 
 echo "[7/7] build bootable ISO"
 P=/c/Users/adria/AppData/Local/Programs/Python/Python311/python.exe

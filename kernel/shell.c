@@ -130,6 +130,7 @@ const command_t commands[] = {
     { "meminfo",  "System",           "memory usage",                       cmd_meminfo },
     { "mem",      "System",           "memory usage (alias)",               cmd_mem },
     { "diskinfo", "System",           "disk/storage status",                cmd_diskinfo },
+    { "sync",     "System",           "flush filesystem to disk",           cmd_sync },
     { "uptime",   "System",           "time since boot",                    cmd_uptime },
     { "battery",  "System",           "battery status",                     cmd_battery },
     { "sensors",  "System",           "hardware sensors",                   cmd_sensors },

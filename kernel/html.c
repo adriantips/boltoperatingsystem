@@ -15,6 +15,12 @@
 #define TITLE_MAX 96
 #define FSTACK_MAX 48
 
+/* entity sentinels: characters with no single ASCII glyph that expand to a
+ * short ASCII string in the parse loop (the bitmap fonts are ASCII-only). */
+#define ENT_COPY  (-2)   /* (c) */
+#define ENT_REG   (-3)   /* (r) */
+#define ENT_TRADE (-4)   /* (tm) */
+
 static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
 /* decode one UTF-8 sequence at s[0..n); return bytes consumed, codepoint in *cp */
@@ -75,6 +81,21 @@ static void push_full(html_doc *d, const char *text, uint32_t n, uint8_t style,
     r->img = -1; r->iw = r->ih = 0; r->pix = 0;
 }
 
+static void cpy(char *d, const char *s, uint32_t cap) {
+    uint32_t i = 0; for (; s[i] && i < cap - 1; i++) d[i] = s[i]; d[i] = 0;
+}
+
+/* emit a form-control run (input / button / textarea / select) */
+static void push_input(html_doc *d, const char *label, int subtype, int w, int h,
+                       uint8_t brk, uint32_t color, uint8_t align, uint8_t indent) {
+    if (d->nruns >= d->runs_cap) return;
+    char *t = arena_push(d, label, (uint32_t)strlen(label));
+    html_run *r = &d->runs[d->nruns++];
+    r->text = t ? t : ""; r->style = HSTYLE_NORMAL; r->link = -1; r->brk = brk;
+    r->kind = HRUN_INPUT; r->align = align; r->indent = indent; r->color = color;
+    r->img = subtype; r->iw = w; r->ih = h; r->pix = 0;
+}
+
 /* decode an entity starting at src[*i]=='&'; return decoded char, advance *i */
 static int decode_entity(const char *src, uint32_t *i, uint32_t len) {
     uint32_t j = *i + 1, start = j;
@@ -90,7 +111,13 @@ static int decode_entity(const char *src, uint32_t *i, uint32_t len) {
             if (dv < 0 || dv >= base) { val = -1; break; }
             val = val * base + dv; j++;
         }
-        if (val >= 0 && j < len && src[j] == ';') { *i = j + 1; return val < 128 ? val : '?'; }
+        if (val >= 0 && j < len && src[j] == ';') {
+            *i = j + 1;
+            if (val == 169) return ENT_COPY;
+            if (val == 174) return ENT_REG;
+            if (val == 8482) return ENT_TRADE;
+            return val < 128 ? val : '?';
+        }
         return -1;
     }
     /* named */
@@ -105,7 +132,9 @@ static int decode_entity(const char *src, uint32_t *i, uint32_t len) {
     else if (strcmp(name, "quot") == 0) out = '"';
     else if (strcmp(name, "apos") == 0) out = '\'';
     else if (strcmp(name, "nbsp") == 0) out = ' ';
-    else if (strcmp(name, "copy") == 0 || strcmp(name, "reg") == 0) out = '?';
+    else if (strcmp(name, "copy") == 0) { *i = j + 1; return ENT_COPY; }
+    else if (strcmp(name, "reg")  == 0) { *i = j + 1; return ENT_REG; }
+    else if (strcmp(name, "trade") == 0) { *i = j + 1; return ENT_TRADE; }
     else if (strcmp(name, "mdash") == 0 || strcmp(name, "ndash") == 0 ||
              strcmp(name, "minus") == 0) out = '-';
     else if (strcmp(name, "ldquo") == 0 || strcmp(name, "rdquo") == 0 ||
@@ -210,22 +239,171 @@ static uint32_t tag_color(const char *tag) {
     return HCOL_NONE;
 }
 
-/* pull alignment from align="" / style="text-align:..." */
+/* ===========================================================================
+ *  Tiny CSS layer. <style> blocks and inline style="" are parsed into a flat
+ *  property set (colour / text-align / bold / italic / hidden). Selectors are
+ *  reduced to their right-most simple selector -- a tag, .class, #id or * --
+ *  so `nav ul li a` matches as `a`. No cascade weighting beyond source order
+ *  and a tag < class < id pass order. Enough to colour and hide real pages.
+ * ===========================================================================*/
+#define CSS_MAX 320
+#define ALIGN_UNSET 0xFF
+typedef struct {
+    char     sel[24];   /* bare ident, lower-cased ('*' for universal) */
+    uint8_t  kind;      /* 0 tag, 1 class, 2 id, 3 universal           */
+    uint32_t color;     /* HCOL_NONE or 0x1RRGGBB                       */
+    uint8_t  align;     /* HALIGN_* or ALIGN_UNSET                      */
+    int8_t   bold;      /* -1 unset, else 0/1                           */
+    int8_t   italic;    /* -1 unset, else 0/1                           */
+    uint8_t  hidden;    /* display:none / visibility:hidden             */
+} css_rule;
+
+static int streqi(const char *a, const char *b) {
+    while (*a && *b) { if (lc(*a) != lc(*b)) return 0; a++; b++; }
+    return *a == *b;
+}
+
+/* is `name` one of the space-separated class names in `cls`? */
+static int cls_has(const char *cls, const char *name) {
+    uint32_t nl = strlen(name);
+    const char *p = cls;
+    while (*p) {
+        while (*p == ' ') p++;
+        const char *q = p; while (*q && *q != ' ') q++;
+        if ((uint32_t)(q - p) == nl) {
+            uint32_t k = 0; for (; k < nl; k++) if (lc(p[k]) != lc(name[k])) break;
+            if (k == nl) return 1;
+        }
+        p = q;
+    }
+    return 0;
+}
+
+/* apply a `prop:val; prop:val` declaration list onto the field set */
+static void css_decl_apply(const char *d, uint32_t n, uint32_t *color, uint8_t *align,
+                           int8_t *bold, int8_t *italic, uint8_t *hidden) {
+    uint32_t i = 0;
+    while (i < n) {
+        while (i < n && (d[i]==';'||d[i]==' '||d[i]=='\t'||d[i]=='\n'||d[i]=='\r')) i++;
+        char prop[20]; uint32_t pl = 0;
+        while (i < n && d[i] != ':' && d[i] != ';' && pl < sizeof(prop)-1) {
+            char c = lc(d[i]); if (c != ' ') prop[pl++] = c; i++;
+        }
+        prop[pl] = 0;
+        if (i >= n || d[i] != ':') { while (i < n && d[i] != ';') i++; continue; }
+        i++;
+        char val[48]; uint32_t vl = 0;
+        while (i < n && d[i] != ';' && vl < sizeof(val)-1) val[vl++] = d[i++];
+        val[vl] = 0;
+        char *v = val; while (*v == ' ') v++;
+        if      (strcmp(prop,"color")==0)       { uint32_t c = parse_color_token(v); if (c) *color = c; }
+        else if (strcmp(prop,"text-align")==0)  { char a = lc(v[0]); *align = a=='c'?HALIGN_CENTER : a=='r'?HALIGN_RIGHT : HALIGN_LEFT; }
+        else if (strcmp(prop,"font-weight")==0) { *bold   = (lc(v[0])=='b' || (v[0]>='6'&&v[0]<='9')) ? 1 : 0; }
+        else if (strcmp(prop,"font-style")==0)  { *italic = (lc(v[0])=='i' || lc(v[0])=='o') ? 1 : 0; }
+        else if (strcmp(prop,"display")==0)     { if (lc(v[0])=='n') *hidden = 1; }
+        else if (strcmp(prop,"visibility")==0)  { if (lc(v[0])=='h') *hidden = 1; }
+    }
+}
+
+/* reduce one selector (s[a..b)) to its right-most simple selector */
+static void sel_extract(const char *s, uint32_t a, uint32_t b, char *out, uint8_t *kind) {
+    out[0] = 0; *kind = 0;
+    while (a < b && (s[a]==' '||s[a]=='\t'||s[a]=='\n'||s[a]=='\r')) a++;
+    while (b > a && (s[b-1]==' '||s[b-1]=='\t'||s[b-1]=='\n'||s[b-1]=='\r')) b--;
+    uint32_t r = a;
+    for (uint32_t k = a; k < b; k++) { char c = s[k]; if (c==' '||c=='>'||c=='+'||c=='~') r = k+1; }
+    if (r < b && s[r] == '*') { out[0] = '*'; out[1] = 0; *kind = 3; return; }
+    int hashp = -1, dotp = -1;
+    for (uint32_t k = r; k < b; k++) { char c = s[k]; if (c==':'||c=='['||c==' ') break;
+        if (c=='#' && hashp<0) hashp = (int)k; if (c=='.' && dotp<0) dotp = (int)k; }
+    uint32_t is;
+    if (hashp >= 0)      { *kind = 2; is = (uint32_t)hashp + 1; }
+    else if (dotp >= 0)  { *kind = 1; is = (uint32_t)dotp + 1; }
+    else                 { *kind = 0; is = r; }
+    uint32_t ie = is, o = 0;
+    while (ie < b) { char c = s[ie]; if (c==':'||c=='['||c==' '||c=='.'||c=='#') break; ie++; }
+    for (uint32_t k = is; k < ie && o < 23; k++) out[o++] = lc(s[k]);
+    out[o] = 0;
+}
+
+/* parse a <style> body into rules[*nr..] */
+static void parse_css(css_rule *rules, int *nr, const char *src, uint32_t len) {
+    uint32_t i = 0;
+    while (i < len && *nr < CSS_MAX) {
+        while (i < len && (src[i]==' '||src[i]=='\n'||src[i]=='\t'||src[i]=='\r')) i++;
+        if (i >= len) break;
+        if (src[i] == '@') {                 /* skip @media / @font-face etc. */
+            int depth = 0;
+            while (i < len) { char c = src[i++];
+                if (c==';' && depth==0) break;
+                if (c=='{') depth++;
+                if (c=='}') { if (--depth <= 0) break; } }
+            continue;
+        }
+        uint32_t s0 = i; while (i < len && src[i] != '{' && src[i] != '}') i++;
+        if (i >= len || src[i] == '}') break;
+        uint32_t s1 = i; i++;
+        uint32_t b0 = i; while (i < len && src[i] != '}') i++;
+        uint32_t b1 = i; if (i < len) i++;
+
+        uint32_t color = HCOL_NONE; uint8_t align = ALIGN_UNSET;
+        int8_t bold = -1, italic = -1; uint8_t hidden = 0;
+        css_decl_apply(src + b0, b1 - b0, &color, &align, &bold, &italic, &hidden);
+        if (color==HCOL_NONE && align==ALIGN_UNSET && bold<0 && italic<0 && !hidden) continue;
+
+        uint32_t p = s0;
+        while (p < s1 && *nr < CSS_MAX) {
+            uint32_t q = p; while (q < s1 && src[q] != ',') q++;
+            char sel[24]; uint8_t kind;
+            sel_extract(src, p, q, sel, &kind);
+            if (sel[0]) {
+                css_rule *r = &rules[(*nr)++];
+                cpy(r->sel, sel, sizeof(r->sel));
+                r->kind = kind; r->color = color; r->align = align;
+                r->bold = bold; r->italic = italic; r->hidden = hidden;
+            }
+            p = q + 1;
+        }
+    }
+}
+
+/* overlay every rule matching (tag, class list, id) onto the field set,
+ * in tag < class < id specificity order */
+static void css_match(const css_rule *rules, int n, const char *tag, const char *cls,
+                      const char *id, uint32_t *color, uint8_t *align,
+                      int8_t *bold, int8_t *italic, uint8_t *hidden) {
+    static const uint8_t order[4] = { 3, 0, 1, 2 };
+    for (int pass = 0; pass < 4; pass++) {
+        uint8_t want = order[pass];
+        for (int k = 0; k < n; k++) {
+            if (rules[k].kind != want) continue;
+            int m = want==3 ? 1
+                  : want==0 ? streqi(rules[k].sel, tag)
+                  : want==1 ? (cls[0] && cls_has(cls, rules[k].sel))
+                  :           (id[0]  && streqi(rules[k].sel, id));
+            if (!m) continue;
+            if (rules[k].color != HCOL_NONE)  *color  = rules[k].color;
+            if (rules[k].align != ALIGN_UNSET) *align = rules[k].align;
+            if (rules[k].bold   >= 0)         *bold   = rules[k].bold;
+            if (rules[k].italic >= 0)         *italic = rules[k].italic;
+            if (rules[k].hidden)              *hidden = 1;
+        }
+    }
+}
+
+/* explicit align="" / inline text-align, or ALIGN_UNSET when absent */
 static uint8_t tag_align(const char *tag) {
     char val[48];
-    const char *a = 0;
-    if (get_attr(tag, "align", val, sizeof(val))) a = val;
-    else if (get_attr(tag, "style", val, sizeof(val))) {
-        for (char *p = val; *p; p++)
-            if (lc(p[0])=='t'&&lc(p[1])=='e'&&lc(p[2])=='x'&&lc(p[3])=='t'&&p[4]=='-') {
-                const char *q = p; while (*q && *q != ':') q++; if (*q == ':') { a = q + 1; break; }
-            }
+    if (get_attr(tag, "align", val, sizeof(val))) {
+        char a = lc(val[0]);
+        return a=='c'?HALIGN_CENTER : a=='r'?HALIGN_RIGHT : HALIGN_LEFT;
     }
-    if (!a) return HALIGN_LEFT;
-    while (*a == ' ') a++;
-    if (lc(a[0])=='c') return HALIGN_CENTER;
-    if (lc(a[0])=='r') return HALIGN_RIGHT;
-    return HALIGN_LEFT;
+    if (get_attr(tag, "style", val, sizeof(val))) {
+        uint32_t c = HCOL_NONE; uint8_t al = ALIGN_UNSET; int8_t b=-1,it=-1; uint8_t h=0;
+        css_decl_apply(val, (uint32_t)strlen(val), &c, &al, &b, &it, &h);
+        return al;
+    }
+    return ALIGN_UNSET;
 }
 
 static html_doc *doc_alloc(uint32_t len) {
@@ -263,18 +441,26 @@ html_doc *html_parse(const char *src, uint32_t len) {
     int     pending_brk = 0, space_pending = 0, line_started = 0;
     int     skip = 0, in_title = 0;
     int     list_depth = 0, bq_depth = 0;
+    char    skipname[12] = "";       /* tag whose body is being dropped */
 
-    /* format stack: each open colour/align tag pushes a frame popped on close */
-    struct { char name[12]; uint32_t color; uint8_t align; } fst[FSTACK_MAX];
+    /* <style> rules collected up front, applied per opening tag */
+    css_rule *rules = (css_rule *)kmalloc(sizeof(css_rule) * CSS_MAX);
+    int nrules = 0;
+
+    /* format stack: open colour/align/css tags push a frame, popped on close */
+    struct { char name[12]; uint32_t color; uint8_t align; int8_t bold, italic; uint8_t hidden; } fst[FSTACK_MAX];
     int fdepth = 0;
 
     #define CUR_COLOR  (fdepth ? fst[fdepth-1].color : HCOL_NONE)
     #define CUR_ALIGN  (fdepth ? fst[fdepth-1].align : HALIGN_LEFT)
+    #define CUR_BOLD   (fdepth && fst[fdepth-1].bold   > 0)
+    #define CUR_ITALIC (fdepth && fst[fdepth-1].italic > 0)
+    #define CUR_HIDDEN (fdepth ? fst[fdepth-1].hidden : 0)
     #define CUR_INDENT ((uint8_t)((list_depth + bq_depth) > 12 ? 12 : (list_depth + bq_depth)))
 
     #define EFF_STYLE() (pre ? HSTYLE_PRE : heading == 1 ? HSTYLE_H1 : heading == 2 ? HSTYLE_H2 \
                         : heading >= 3 ? HSTYLE_H3 : link >= 0 ? HSTYLE_LINK : mono ? HSTYLE_CODE \
-                        : italic ? HSTYLE_ITALIC : bold ? HSTYLE_BOLD : HSTYLE_NORMAL)
+                        : (italic || CUR_ITALIC) ? HSTYLE_ITALIC : (bold || CUR_BOLD) ? HSTYLE_BOLD : HSTYLE_NORMAL)
 
     #define FLUSH() do { if (seglen) { push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, \
                                 CUR_COLOR, CUR_ALIGN, CUR_INDENT); seglen = 0; pending_brk = 0; } } while (0)
@@ -305,28 +491,111 @@ html_doc *html_parse(const char *src, uint32_t len) {
             name[nl] = 0;
 
             if (skip) {
-                if (closing && (strcmp(name, "script") == 0 || strcmp(name, "style") == 0)) skip = 0;
+                if (closing && strcmp(name, skipname) == 0) {
+                    skip = 0;
+                    if (fdepth > 0 && strcmp(fst[fdepth-1].name, name) == 0) fdepth--;
+                }
                 continue;
             }
 
-            /* format stack: push on opening colour/align tags, pop on close */
+            /* format stack: push on opening fmt/css tags, pop on close */
+            int fchanged = 0;
             if (!closing && !is_void_tag(name)) {
-                uint32_t col = tag_color(tag);
-                uint8_t  al  = tag_align(tag);
-                int is_fmt = (col != HCOL_NONE) || (al != HALIGN_LEFT) ||
-                             strcmp(name,"center")==0 || strcmp(name,"font")==0 || strcmp(name,"span")==0;
+                char cls[96]; cls[0] = 0; get_attr(tag, "class", cls, sizeof(cls));
+                char idv[64]; idv[0] = 0; get_attr(tag, "id",    idv, sizeof(idv));
+                uint32_t col = HCOL_NONE; uint8_t al = ALIGN_UNSET;
+                int8_t cb = -1, ci = -1; uint8_t hid = 0;
+                if (rules) css_match(rules, nrules, name, cls, idv, &col, &al, &cb, &ci, &hid);
+                /* inline style / presentational attrs override the rule set */
+                char sv[160];
+                if (get_attr(tag, "style", sv, sizeof(sv)))
+                    css_decl_apply(sv, (uint32_t)strlen(sv), &col, &al, &cb, &ci, &hid);
+                { uint32_t ic = tag_color(tag); if (ic != HCOL_NONE) col = ic; }
+                { uint8_t ia = tag_align(tag); if (ia != ALIGN_UNSET) al = ia; }
+                if (strcmp(name,"center")==0 && al == ALIGN_UNSET) al = HALIGN_CENTER;
+                int has = (col!=HCOL_NONE) || (al!=ALIGN_UNSET) || (cb>=0) || (ci>=0) || hid;
+                int is_fmt = has || strcmp(name,"center")==0 || strcmp(name,"font")==0 || strcmp(name,"span")==0;
                 if (is_fmt && fdepth < FSTACK_MAX) {
-                    uint32_t pc = (col != HCOL_NONE) ? col : CUR_COLOR;
-                    uint8_t  pa = (al != HALIGN_LEFT) ? al : (strcmp(name,"center")==0 ? HALIGN_CENTER : CUR_ALIGN);
+                    FLUSH();                       /* preceding text is the parent's */
+                    fst[fdepth].color  = (col != HCOL_NONE)   ? col : CUR_COLOR;
+                    fst[fdepth].align  = (al  != ALIGN_UNSET) ? al  : CUR_ALIGN;
+                    fst[fdepth].bold   = (cb >= 0) ? cb : (fdepth ? fst[fdepth-1].bold   : -1);
+                    fst[fdepth].italic = (ci >= 0) ? ci : (fdepth ? fst[fdepth-1].italic : -1);
+                    fst[fdepth].hidden = hid ? 1 : (uint8_t)CUR_HIDDEN;
                     uint32_t k = 0; while (name[k] && k < 11) { fst[fdepth].name[k] = name[k]; k++; } fst[fdepth].name[k] = 0;
-                    fst[fdepth].color = pc; fst[fdepth].align = pa; fdepth++;
+                    fdepth++; fchanged = 1;
                 }
             } else if (closing && fdepth > 0) {
-                if (strcmp(fst[fdepth-1].name, name) == 0) fdepth--;
-                else for (int s = fdepth - 1; s >= 0; s--) if (strcmp(fst[s].name, name) == 0) { fdepth = s; break; }
+                int target = -1;
+                if (strcmp(fst[fdepth-1].name, name) == 0) target = fdepth - 1;
+                else for (int s = fdepth - 1; s >= 0; s--) if (strcmp(fst[s].name, name) == 0) { target = s; break; }
+                if (target >= 0) { FLUSH(); fdepth = target; fchanged = 1; }  /* flush child text first */
             }
+            if (fchanged) style = EFF_STYLE();
 
-            if (strcmp(name, "script") == 0 || strcmp(name, "style") == 0) { if (!closing) skip = 1; continue; }
+            if (strcmp(name, "style") == 0) {
+                if (!closing && rules) {
+                    uint32_t s0 = i;
+                    while (i < len) {                  /* scan to </style> */
+                        if (src[i]=='<' && i+1<len && src[i+1]=='/') {
+                            uint32_t k = i+2, z = 0; char nm[8];
+                            while (k < len && z < 7 && src[k] != '>' && src[k] != ' ') nm[z++] = lc(src[k++]);
+                            nm[z] = 0;
+                            if (strcmp(nm, "style") == 0) break;
+                        }
+                        i++;
+                    }
+                    parse_css(rules, &nrules, src + s0, i - s0);
+                    while (i < len && src[i] != '>') i++; if (i < len) i++;
+                }
+                continue;
+            }
+            if (strcmp(name, "script") == 0) { if (!closing) { skip = 1; cpy(skipname, "script", sizeof(skipname)); } continue; }
+            if (strcmp(name, "input") == 0) {
+                FLUSH();
+                if (CUR_HIDDEN) continue;
+                char ty[16]; ty[0] = 0; if (get_attr(tag, "type", ty, sizeof(ty))) for (int z = 0; ty[z]; z++) ty[z] = lc(ty[z]);
+                if (strcmp(ty, "hidden") == 0) continue;
+                if (strcmp(ty,"checkbox")==0 || strcmp(ty,"radio")==0) {
+                    push_input(d, strcmp(ty,"radio")==0 ? "( )" : "[ ]", 0, 18, 18,
+                               (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                    pending_brk = 0; continue;
+                }
+                int sub = 0; char lbl[96]; lbl[0] = 0;
+                if (strcmp(ty,"submit")==0 || strcmp(ty,"button")==0 || strcmp(ty,"reset")==0) {
+                    sub = 1;
+                    if (!get_attr(tag, "value", lbl, sizeof(lbl)) || !lbl[0])
+                        cpy(lbl, strcmp(ty,"reset")==0 ? "Reset" : "Submit", sizeof(lbl));
+                } else if (!get_attr(tag, "placeholder", lbl, sizeof(lbl))) {
+                    get_attr(tag, "value", lbl, sizeof(lbl));
+                }
+                char sz[8]; int w = get_attr(tag, "size", sz, sizeof(sz)) ? atoi(sz) * 9 : 0;
+                push_input(d, lbl, sub, w, sub ? 26 : 22, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                pending_brk = 0; continue;
+            }
+            if (strcmp(name, "textarea") == 0) {
+                if (!closing) {
+                    FLUSH();
+                    if (!CUR_HIDDEN) {
+                        char ph[96]; ph[0] = 0; get_attr(tag, "placeholder", ph, sizeof(ph));
+                        push_input(d, ph, 2, 0, 60, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                        pending_brk = 0;
+                    }
+                    skip = 1; cpy(skipname, "textarea", sizeof(skipname));
+                }
+                continue;
+            }
+            if (strcmp(name, "select") == 0) {
+                if (!closing) {
+                    FLUSH();
+                    if (!CUR_HIDDEN) {
+                        push_input(d, "", 3, 160, 22, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                        pending_brk = 0;
+                    }
+                    skip = 1; cpy(skipname, "select", sizeof(skipname));
+                }
+                continue;
+            }
             if (strcmp(name, "title") == 0) { FLUSH(); in_title = !closing; if (closing && titlelen) {
                     title[titlelen] = 0; d->title = arena_push(d, title, titlelen); titlelen = 0; } continue; }
 
@@ -349,6 +618,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
             }
             if (strcmp(name, "img") == 0) {
                 FLUSH();
+                if (CUR_HIDDEN) continue;
                 char srcv[256]; get_attr(tag, "src", srcv, sizeof(srcv));
                 if (srcv[0] && d->nimgs < d->imgs_cap && d->nruns < d->runs_cap) {
                     char *s = arena_push(d, srcv, (uint32_t)strlen(srcv));
@@ -413,6 +683,22 @@ html_doc *html_parse(const char *src, uint32_t len) {
 
         if (c == '&') {
             int e = decode_entity(src, &i, len);
+            if (CUR_HIDDEN && !in_title) continue;
+            if (e <= ENT_COPY) {                            /* multi-char ASCII expansion */
+                const char *rep = (e == ENT_COPY) ? "(c)" : (e == ENT_REG) ? "(r)" : "(tm)";
+                if (!in_title && !pre) {
+                    if (space_pending && (seglen > 0 || (pending_brk == 0 && line_started)) && seglen < SEG_MAX - 1)
+                        seg[seglen++] = ' ';
+                    space_pending = 0;
+                    for (const char *q = rep; *q && seglen < SEG_MAX - 1; q++) seg[seglen++] = *q;
+                    line_started = 1;
+                } else if (in_title) {
+                    for (const char *q = rep; *q && titlelen < TITLE_MAX - 1; q++) title[titlelen++] = *q;
+                } else { /* pre */
+                    for (const char *q = rep; *q && seglen < SEG_MAX - 1; q++) seg[seglen++] = *q;
+                }
+                continue;
+            }
             if (e >= 0) c = (char)e; else { i++; }
         } else if ((unsigned char)c >= 0x80) {              /* UTF-8 multibyte */
             uint32_t cp; int adv = utf8_decode((const unsigned char *)(src + i), len - i, &cp);
@@ -428,6 +714,8 @@ html_doc *html_parse(const char *src, uint32_t len) {
             } else if (titlelen < TITLE_MAX - 1) title[titlelen++] = c;
             continue;
         }
+
+        if (CUR_HIDDEN) continue;                          /* display:none subtree */
 
         if (pre) {
             if (c == '\n') { FLUSH(); pending_brk = 1; }
@@ -450,6 +738,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
         }
     }
     if (seglen) push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+    if (rules) kfree(rules);
     return d;
 }
 

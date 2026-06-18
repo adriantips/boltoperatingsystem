@@ -18,7 +18,9 @@ enum {
     HSTYLE_CODE,
 };
 
-enum { HRUN_TEXT = 0, HRUN_IMG };
+enum { HRUN_TEXT = 0, HRUN_IMG, HRUN_INPUT };
+/* HRUN_INPUT subtype is carried in html_run.img: 0 text field, 1 button,
+ * 2 textarea, 3 select. html_run.iw/ih give a box size hint (0 = auto). */
 enum { HALIGN_LEFT = 0, HALIGN_CENTER, HALIGN_RIGHT };
 
 #define HCOL_NONE 0u            /* run uses its style's default colour */

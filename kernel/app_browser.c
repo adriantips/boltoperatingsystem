@@ -60,19 +60,29 @@ static void sappend(char *d, const char *s, uint32_t cap) {
 }
 static void set_status(browser_t *st, const char *s) { scopy(st->status, s, sizeof(st->status)); }
 
+/* ---- page palette ------------------------------------------------------ *
+ * Web pages are authored for a white canvas with dark text, so the body is
+ * painted light regardless of the (dark) OS window chrome. */
+#define WEB_BG    0xFFFFFF      /* page background                          */
+#define WEB_TEXT  0x202124      /* body text (Google near-black grey)       */
+#define WEB_DIM   0x5F6368      /* secondary / italic grey                  */
+#define WEB_LINK  0x1A73E8      /* anchor blue                              */
+#define WEB_CODE  0x0B7D3E      /* monospace / preformatted green           */
+#define WEB_PLACE 0xE8E8EC      /* missing-image placeholder fill           */
+
 /* ---- style metrics ----------------------------------------------------- */
 static void metrics(uint8_t style, int *scale, int *lh, uint32_t *col, int *italic) {
     *italic = 0;
     switch (style) {
-    case HSTYLE_H1: *scale = 2; *lh = 36; *col = 0xFFFFFF; break;
-    case HSTYLE_H2: *scale = 2; *lh = 30; *col = 0xF0F0F4; break;
-    case HSTYLE_H3: *scale = 1; *lh = 24; *col = 0xFFFFFF; break;
-    case HSTYLE_BOLD:*scale = 1; *lh = 18; *col = 0xFFFFFF; break;
-    case HSTYLE_LINK:*scale = 1; *lh = 18; *col = COL_ACCENT; break;
-    case HSTYLE_PRE: *scale = 1; *lh = 17; *col = 0x9FE0A0; break;
-    case HSTYLE_CODE:*scale = 1; *lh = 18; *col = 0x9FE0A0; break;
-    case HSTYLE_ITALIC:*scale = 1; *lh = 18; *col = 0xC8C8D0; *italic = 1; break;
-    default:         *scale = 1; *lh = 18; *col = 0xC8C8D0; break;
+    case HSTYLE_H1: *scale = 2; *lh = 36; *col = WEB_TEXT; break;
+    case HSTYLE_H2: *scale = 2; *lh = 30; *col = WEB_TEXT; break;
+    case HSTYLE_H3: *scale = 1; *lh = 24; *col = WEB_TEXT; break;
+    case HSTYLE_BOLD:*scale = 1; *lh = 18; *col = WEB_TEXT; break;
+    case HSTYLE_LINK:*scale = 1; *lh = 18; *col = WEB_LINK; break;
+    case HSTYLE_PRE: *scale = 1; *lh = 17; *col = WEB_CODE; break;
+    case HSTYLE_CODE:*scale = 1; *lh = 18; *col = WEB_CODE; break;
+    case HSTYLE_ITALIC:*scale = 1; *lh = 18; *col = WEB_DIM; *italic = 1; break;
+    default:         *scale = 1; *lh = 18; *col = WEB_TEXT; break;
     }
 }
 
@@ -89,6 +99,7 @@ typedef struct {
     const char *text; int len;     /* text item */
     int      is_img; image_t *pix; int dw, dh; /* image item */
     int      italic;
+    int      is_input, subtype;    /* form control: 0 field,1 button,2 area,3 select */
 } litem;
 
 #define MAXLINE 320
@@ -107,11 +118,26 @@ static void emit_line(browser_t *st, int cx, int cy, int draw, int *pen_y,
             for (int k = 0; k < n; k++) {
                 litem *it = &LINE[k];
                 int ax = cx + xstart + off + it->x;
-                if (it->is_img) {
+                if (it->is_input) {
+                    uint32_t fill = it->subtype == 1 ? 0xE8F0FE : 0xFFFFFF;
+                    uint32_t brd  = it->subtype == 1 ? WEB_LINK : 0xC0C0C8;
+                    g_round(ax, cy + py, it->dw, it->dh, 5, fill, 255);
+                    g_rect(ax, cy + py, it->dw, it->dh, brd);
+                    int ty = cy + py + (it->dh - 8) / 2;
+                    if (it->subtype == 1) {                    /* button: centred label */
+                        int tw = g_text_width_pn(it->text, it->len, 1);
+                        g_text_pn(ax + (it->dw - tw) / 2, ty, it->text, it->len, WEB_LINK, 1, 0);
+                    } else {                                   /* field / textarea / select */
+                        int tyo = it->subtype == 2 ? cy + py + 5 : ty;
+                        if (it->len) g_text_pn(ax + 6, tyo, it->text, it->len, WEB_DIM, 1, 0);
+                        if (it->subtype == 3) g_text(ax + it->dw - 12, ty, "v", WEB_DIM, 1);
+                    }
+                } else if (it->is_img) {
                     if (it->pix) g_blit(ax, cy + py, it->dw, it->dh, it->pix->px, it->pix->w, it->pix->h);
                     else {
-                        g_rect(ax, cy + py, it->dw, it->dh, 0x55556A);
-                        g_text(ax + 4, cy + py + it->dh/2 - 4, it->text, COL_TEXT_DIM, 1);
+                        g_fill(ax, cy + py, it->dw, it->dh, WEB_PLACE);
+                        g_rect(ax, cy + py, it->dw, it->dh, 0xC0C0C8);
+                        g_text(ax + 4, cy + py + it->dh/2 - 4, it->text, WEB_DIM, 1);
                     }
                     if (it->link >= 0 && st->nhits < (int)(sizeof(st->hits)/sizeof(st->hits[0])))
                         st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->dw, it->dh, it->link };
@@ -169,10 +195,32 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
                 n = 0; cur_x = 0; line_h = 0;
             }
             if (n < MAXLINE) {
-                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, (int)strlen(r->text), 1, im, dw, dh, 0 };
+                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, (int)strlen(r->text), 1, im, dw, dh, 0, 0, 0 };
                 n++;
             }
             cur_x += dw + 4;
+            if (dh > line_h) line_h = dh;
+            continue;
+        }
+
+        if (r->kind == HRUN_INPUT) {
+            int sub = r->img;
+            int tlen = (int)strlen(r->text);
+            int dw = r->iw > 0 ? r->iw
+                   : sub == 1 ? g_text_width_pn(r->text, tlen, 1) + 24
+                   : sub == 2 ? 240 : 160;
+            int dh = r->ih > 0 ? r->ih : 22;
+            if (dw > avail) dw = avail;
+            if (dw < 1) dw = 1; if (dh < 1) dh = 1;
+            if (cur_x > 0 && cur_x + dw > avail) {
+                emit_line(st, cx, cy, draw, &pen_y, n, line_h, xstart, avail, align, Y0, Yb);
+                n = 0; cur_x = 0; line_h = 0;
+            }
+            if (n < MAXLINE) {
+                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, tlen, 0, 0, dw, dh, 0, 1, sub };
+                n++;
+            }
+            cur_x += dw + 6;
             if (dh > line_h) line_h = dh;
             continue;
         }
@@ -192,7 +240,7 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
             }
             cur_x += space;
             if (n < MAXLINE) {
-                LINE[n] = (litem){ cur_x, ww, scale, lh, color, r->link, w, wl, 0, 0, 0, 0, italic };
+                LINE[n] = (litem){ cur_x, ww, scale, lh, color, r->link, w, wl, 0, 0, 0, 0, italic, 0, 0 };
                 n++;
             }
             cur_x += ww;
@@ -419,7 +467,7 @@ static void browser_draw(window_t *w, int cx, int cy, int cw, int ch) {
     browser_t *st = &B;
     st->cw = cw; st->ch = ch;
 
-    g_fill(cx, cy, cw, ch, 0x0F0F16);
+    g_fill(cx, cy, cw, ch, WEB_BG);
     /* toolbar */
     g_fill(cx, cy, cw, TOOLBAR_H, COL_PANEL_2);
     g_hline(cx, cy + TOOLBAR_H, cw, 0x33333F);
@@ -451,18 +499,18 @@ static void browser_draw(window_t *w, int cx, int cy, int cw, int ch) {
     int Y0 = TOOLBAR_H, Yb = ch - STATUS_H;
     g_set_clip(cx, cy + Y0, cw, Yb - Y0);
     if (st->doc) layout(st, cx, cy, 1);
-    else g_text(cx + 14, cy + Y0 + 12, "No page loaded.", COL_TEXT_DIM, 1);
+    else g_text(cx + 14, cy + Y0 + 12, "No page loaded.", WEB_DIM, 1);
     g_set_clip(cx, cy, cw, ch);
 
     /* scrollbar */
     int track_y = cy + Y0, track_h = Yb - Y0;
     int vh = Yb - Y0;
-    g_fill(cx + cw - SBW - 4, track_y, SBW, track_h, 0x16161E);
+    g_fill(cx + cw - SBW - 4, track_y, SBW, track_h, 0xF1F1F3);
     if (st->content_h > vh) {
         int thumb_h = vh * vh / st->content_h; if (thumb_h < 20) thumb_h = 20;
         int maxscroll = st->content_h - vh;
         int thumb_y = track_y + (track_h - thumb_h) * st->scroll / (maxscroll ? maxscroll : 1);
-        g_round(cx + cw - SBW - 3, thumb_y, SBW - 2, thumb_h, 3, COL_ACCENT_DIM, 255);
+        g_round(cx + cw - SBW - 3, thumb_y, SBW - 2, thumb_h, 3, 0xC1C1C7, 255);
     }
 
     /* status bar */
@@ -539,7 +587,19 @@ static void browser_click(window_t *w, int lx, int ly) {
 /* ---- a built-in start page + a sample local file ----------------------- */
 static const char WELCOME[] =
     "<title>BoltOS Browser</title>"
+    "<style>"
+    "  h1 { color: #1a73e8; text-align: center; }"
+    "  .tag { color: #5f6368; font-style: italic; text-align: center; }"
+    "  .note { color: #0b7d3e; font-weight: bold; }"
+    "  .hidden { display: none; }"
+    "</style>"
     "<h1>BoltOS Browser</h1>"
+    "<p class=\"tag\">now with CSS styling and form controls</p>"
+    "<p class=\"hidden\">This line is display:none and must not render.</p>"
+    "<form>"
+    "<p>Search: <input type=\"text\" placeholder=\"Type and press Go\" size=\"22\"> "
+    "<input type=\"submit\" value=\"Search\"></p>"
+    "</form>"
     "<p>A tiny web browser running on a from-scratch kernel. It speaks HTTP and "
     "HTTPS (TLS 1.2: ECDHE-X25519 / AES-128-GCM) over the BoltOS TCP/IP stack, and "
     "can open local HTML files from the ramfs. The server certificate is not "
